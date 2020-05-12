@@ -796,10 +796,14 @@ impl Connection {
         let len = octets::varint_len(flow_id) + buf.len();
         let dgram_len = super::frame::MAX_DGRAM_OVERHEAD + len;
 
-        if dgram_len > conn.peer_transport_params.max_datagram_frame_size as usize
-        {
-            return Err(Error::BufferTooShort);
-        }
+        match conn.peer_transport_params.max_datagram_frame_size {
+            Some(max_dgram) => if dgram_len > (max_dgram as usize) {
+                return Err(Error::BufferTooShort);
+            },
+            None => { 
+                return Err(Error::BufferTooShort); 
+            },
+        };
 
         let mut d = vec![0; len as usize];
 

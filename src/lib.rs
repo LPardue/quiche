@@ -725,7 +725,7 @@ impl Config {
     ///
     /// The default is `0`.
     pub fn set_max_datagram_frame_size(&mut self, v: u64) {
-        self.local_transport_params.max_datagram_frame_size = v;
+        self.local_transport_params.max_datagram_frame_size = Some(v);
     }
 
     /// Configures whether to enable HyStart++.
@@ -2826,25 +2826,25 @@ impl Connection {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn dgram_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let len = self.dgram_queue.pop_readable(buf)?;
-
-        if len > self.local_transport_params.max_datagram_frame_size as usize {
-            trace!("received a DATAGRAM larger than max_datagram_frame_size");
-            return Err(Error::BufferTooShort);
-        }
-
-        Ok(len)
+        Ok(self.dgram_queue.pop_readable(buf)?)
     }
 
     /// Send data in a Datagram frame.
     ///
     /// [`Done`] is returned if no data was written.
+    /// [`InvalidState`] is returned if the peer does not support datagrams.
+    /// [`BufferTooShort`] is returned if the datagram frame length is larger
+    /// than peer's supported datagram frame length. Use
+    /// `peer_datagram_frame_size` to get the largest supported datagram
+    /// frame length.
     ///
     /// Note that there is no flow control of Datagram frames, so in order to
     /// avoid buffering an infinite amount of frames we apply an internal
     /// limit.
     ///
     /// [`Done`]: enum.Error.html#variant.Done
+    /// [`InvalidState`]: enum.Error.html#variant.InvalidState
+    /// [`BufferTooShort`]: enum.Error.html#variant.BufferTooShort
     ///
     /// ## Examples:
     ///
@@ -2858,15 +2858,48 @@ impl Connection {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn dgram_send(&mut self, buf: &[u8]) -> Result<()> {
-        if buf.len() > self.peer_transport_params.max_datagram_frame_size as usize
-        {
-            trace!("attempt to send DATAGRAM larger than peer's max_datagram_frame_size");
+        let max_size = match self.peer_transport_params.max_datagram_frame_size {
+            Some(v) => v as usize,
+            None => {
+                trace!("attempt to send DATAGRAM to a peer without \
+                        max_datagram_frame_size");
+                return Err(Error::InvalidState);
+            },
+        };
+
+        if buf.len() > max_size {
+            trace!("attempt to send DATAGRAM larger than peer's \
+                    max_datagram_frame_size");
             return Err(Error::BufferTooShort);
         }
 
         self.dgram_queue.push_writable(buf)?;
 
         Ok(())
+    }
+
+    /// Gets the size of the largest Datagram frame supported by peer.
+    ///
+    /// [`None`] is returned if the peer hasn't advertised a maximum datagram
+    /// frame size.
+    ///
+    /// ## Examples:
+    ///
+    /// ```no_run
+    /// # let mut buf = [0; 512];
+    /// # let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    /// # let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
+    /// # let scid = [0xba; 16];
+    /// # let mut conn = quiche::accept(&scid, None, &mut config)?;
+    /// if let Some(frame_size) = conn.peer_datagram_frame_size() {
+    ///     if frame_size > 5 {
+    ///         conn.dgram_send(b"hello")?;
+    ///     }
+    /// }
+    /// # Ok::<(), quiche::Error>(())
+    /// ```
+    pub fn peer_datagram_frame_size(&self) -> Option<u64> {
+        self.peer_transport_params.max_datagram_frame_size
     }
 
     /// Returns the amount of time until the next timeout event.
@@ -3448,7 +3481,31 @@ impl Connection {
             },
 
             frame::Frame::Datagram { data } => {
-                self.dgram_queue.push_readable(&data)?;
+                // Close the connection if received datagram violates advertised
+                // limits (this must propagate as a PROTOCOL_VIOLATION).
+                let max_size =
+                    match self.local_transport_params.max_datagram_frame_size
+                {
+                    Some(v) => v as usize,
+                    None => {
+                        trace!("received a datagram without \
+                                max_datagram_frame_size; closing.");
+                        return Err(Error::InvalidState);
+                    },
+                };
+
+                if data.len() > max_size {
+                    trace!("attempt to send datagram larger than peer's \
+                            max_datagram_frame_size; closing.");
+                    return Err(Error::InvalidState);
+                }
+                
+                // If recv queue is full, best option is probably to just
+                // lose the packet. Datagrams have no flow control.
+                match self.dgram_queue.push_readable(&data) {
+                    Ok(()) | Err(Error::Done) => { },
+                    err => { return err; },
+                }
             },
         }
 
@@ -3608,7 +3665,7 @@ struct TransportParams {
     pub disable_active_migration: bool,
     // pub preferred_address: ...,
     pub active_conn_id_limit: u64,
-    pub max_datagram_frame_size: u64,
+    pub max_datagram_frame_size: Option<u64>,
 }
 
 impl Default for TransportParams {
@@ -3628,7 +3685,7 @@ impl Default for TransportParams {
             max_ack_delay: 25,
             disable_active_migration: false,
             active_conn_id_limit: 0,
-            max_datagram_frame_size: 0,
+            max_datagram_frame_size: None,
         }
     }
 }
@@ -3748,7 +3805,7 @@ impl TransportParams {
                 },
 
                 0x0020 => {
-                    tp.max_datagram_frame_size = val.get_varint()?;
+                    tp.max_datagram_frame_size = Some(val.get_varint()?);
                 },
 
                 // Ignore unknown parameters.
@@ -3877,13 +3934,13 @@ impl TransportParams {
             b.put_varint(tp.max_ack_delay)?;
         }
 
-        if tp.max_datagram_frame_size != 0 {
+        if let Some(max_datagram_frame_size) = tp.max_datagram_frame_size {
             TransportParams::encode_param(
                 &mut b,
                 0x0020,
-                octets::varint_len(tp.max_datagram_frame_size),
+                octets::varint_len(max_datagram_frame_size),
             )?;
-            b.put_varint(tp.max_datagram_frame_size)?;
+            b.put_varint(max_datagram_frame_size)?;
         }
 
         if tp.disable_active_migration {
@@ -4261,7 +4318,7 @@ mod tests {
             max_ack_delay: 2_u64.pow(14) - 1,
             disable_active_migration: true,
             active_conn_id_limit: 8,
-            max_datagram_frame_size: 32,
+            max_datagram_frame_size: Some(32),
         };
 
         let mut raw_params = [42; 256];
@@ -4289,7 +4346,7 @@ mod tests {
             max_ack_delay: 2_u64.pow(14) - 1,
             disable_active_migration: true,
             active_conn_id_limit: 8,
-            max_datagram_frame_size: 32,
+            max_datagram_frame_size: Some(32),
         };
 
         let mut raw_params = [42; 256];
@@ -5954,6 +6011,51 @@ mod tests {
         assert_eq!(iter.next(), Some(&frame::Frame::Padding { len: 1 }));
 
         assert_eq!(iter.next(), None);
+    }
+
+    #[test]
+    fn dgram_send_fails_invalidstate() {
+        let mut buf = [0; 65535];
+
+        let mut pipe = testing::Pipe::default().unwrap();
+
+        assert_eq!(pipe.handshake(&mut buf), Ok(()));
+
+        assert_eq!(
+            pipe.client.dgram_send(b"hello, world"), 
+            Err(Error::InvalidState));
+    }
+
+    #[test]
+    fn dgram_single_datagram() {
+        let mut buf = [0; 65535];
+
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config.load_cert_chain_from_pem_file("examples/cert.crt").unwrap();
+        config.load_priv_key_from_pem_file("examples/cert.key").unwrap();
+        config.set_application_protos(b"\x06proto1\x06proto2").unwrap();
+        config.set_initial_max_data(30);
+        config.set_initial_max_stream_data_bidi_local(15);
+        config.set_initial_max_stream_data_bidi_remote(15);
+        config.set_initial_max_stream_data_uni(10);
+        config.set_initial_max_streams_bidi(3);
+        config.set_initial_max_streams_uni(3);
+        config.set_max_datagram_frame_size(65535);
+        config.verify_peer(false);
+
+        let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
+
+        assert_eq!(pipe.handshake(&mut buf), Ok(()));
+
+        assert_eq!(pipe.client.dgram_send(b"hello, world"), Ok(()));
+
+        assert_eq!(pipe.advance(&mut buf), Ok(()));
+
+        let result = pipe.server.dgram_recv(&mut buf);
+        assert_eq!(result, Ok(12));
+
+        let result = pipe.server.dgram_recv(&mut buf);
+        assert_eq!(result, Err(Error::Done));
     }
 }
 
