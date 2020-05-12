@@ -800,8 +800,8 @@ impl Connection {
             Some(max_dgram) => if dgram_len > (max_dgram as usize) {
                 return Err(Error::BufferTooShort);
             },
-            None => { 
-                return Err(Error::BufferTooShort); 
+            None => {
+                return Err(Error::BufferTooShort);
             },
         };
 

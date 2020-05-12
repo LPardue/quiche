@@ -3499,7 +3499,7 @@ impl Connection {
                             max_datagram_frame_size; closing.");
                     return Err(Error::InvalidState);
                 }
-                
+
                 // If recv queue is full, best option is probably to just
                 // lose the packet. Datagrams have no flow control.
                 match self.dgram_queue.push_readable(&data) {
@@ -6022,7 +6022,7 @@ mod tests {
         assert_eq!(pipe.handshake(&mut buf), Ok(()));
 
         assert_eq!(
-            pipe.client.dgram_send(b"hello, world"), 
+            pipe.client.dgram_send(b"hello, world"),
             Err(Error::InvalidState));
     }
 
