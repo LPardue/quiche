@@ -30,23 +30,41 @@ use crate::octets;
 
 use crate::h3::Header;
 
-use super::INDEXED;
-use super::LITERAL;
-use super::LITERAL_WITH_NAME_REF;
+use super::enc_prefix;
+use super::rep_prefix;
+use super::start;
+
 
 /// A QPACK encoder.
-pub struct Encoder {}
-
-impl Default for Encoder {
-    fn default() -> Encoder {
-        Encoder {}
-    }
+pub struct Encoder {
+    max_table_capacity: Option<u64>,
+    chosen_capacity: u64,
 }
 
 impl Encoder {
     /// Creates a new QPACK encoder.
     pub fn new() -> Encoder {
-        Encoder::default()
+        Encoder {
+            max_table_capacity: None,
+            chosen_capacity: 0
+        }
+    }
+
+    pub fn set_max_table_capacity(&mut self, capacity: u64) {
+        if self.max_table_capacity.is_some() {
+            return;
+        }
+
+        self.max_table_capacity = Some(capacity);
+
+        // TODO understand better how to pick the desired capacity
+        self.chosen_capacity = capacity;
+    }
+
+    pub fn capacity_instruction(&self, out: &mut [u8]) -> Result<()> {
+        let mut b = octets::OctetsMut::with_slice(out);
+        encode_int(self.chosen_capacity, start::SET_CAPACITY, enc_prefix::SET_CAPACITY, &mut b)?;
+        Ok(())
     }
 
     /// Encodes a list of headers into a QPACK header block.
@@ -56,38 +74,33 @@ impl Encoder {
         let mut b = octets::OctetsMut::with_slice(out);
 
         // Request Insert Count.
-        encode_int(0, 0, 8, &mut b)?;
+        encode_int(0, 0, rep_prefix::REQUIRED_INSERT_COUNT, &mut b)?;
 
         // Base.
-        encode_int(0, 0, 7, &mut b)?;
+        encode_int(0, 0, rep_prefix::BASE, &mut b)?;
 
         for h in headers {
             match lookup_static(h) {
                 Some((idx, true)) => {
-                    const STATIC: u8 = 0x40;
+                    const STATIC: u8 = 0b0100_0000;
 
                     // Encode as statically indexed.
-                    encode_int(idx, INDEXED | STATIC, 6, &mut b)?;
+                    encode_int(idx, start::INDEXED | STATIC, rep_prefix::FIELD_INDEX, &mut b)?;
                 },
 
                 Some((idx, false)) => {
-                    const STATIC: u8 = 0x10;
+                    const STATIC: u8 = 0b0001_0000;
 
                     // Encode value as literal with static name reference.
-                    encode_int(idx, LITERAL_WITH_NAME_REF | STATIC, 4, &mut b)?;
-                    encode_str(&h.1, 7, &mut b)?;
+                    encode_int(idx, start::LITERAL_WITH_NAME_REF | STATIC, rep_prefix::NAME_INDEX, &mut b)?;
+                    encode_str(&h.1, &mut b, false)?;
                 },
 
                 None => {
                     // Encode as fully literal.
-                    let name_len =
-                        super::huffman::encode_output_length(h.0.as_bytes())?;
+                    encode_str(&h.0, &mut b, true)?;
 
-                    encode_int(name_len as u64, LITERAL | 0x08, 3, &mut b)?;
-
-                    super::huffman::encode(h.0.as_bytes(), &mut b)?;
-
-                    encode_str(&h.1, 7, &mut b)?;
+                    encode_str(&h.1, &mut b, false)?;
                 },
             };
         }
@@ -275,10 +288,16 @@ fn encode_int(
     Ok(())
 }
 
-fn encode_str(v: &str, prefix: usize, b: &mut octets::OctetsMut) -> Result<()> {
+fn encode_str(v: &str, b: &mut octets::OctetsMut, name: bool) -> Result<()> {
     let len = super::huffman::encode_output_length(v.as_bytes())?;
 
-    encode_int(len as u64, 0x80, prefix, b)?;
+    let (first, prefix) = if name {
+        (start::LITERAL | 0b0000_1000, rep_prefix::NAME_LENGTH)
+    } else {
+        (0b1000_0000, rep_prefix::VALUE_LENGTH)
+    };
+
+    encode_int(len as u64, first, prefix, b)?;
 
     super::huffman::encode(v.as_bytes(), b)?;
 

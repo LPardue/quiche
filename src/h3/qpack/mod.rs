@@ -26,10 +26,53 @@
 
 //! HTTP/3 header compression (QPACK).
 
-const INDEXED: u8 = 0b1000_0000;
-const INDEXED_WITH_POST_BASE: u8 = 0b0001_0000;
-const LITERAL: u8 = 0b0010_0000;
-const LITERAL_WITH_NAME_REF: u8 = 0b0100_0000;
+mod start {
+    // Encoder instructions
+    pub const SET_CAPACITY: u8 = 0b0001_0000;
+    pub const INSERT_WITH_NAME: u8 = 0b1000_0000;
+    pub const INSERT_WITHOUT_NAME: u8 = 0b0100_0000;
+    pub const DUPLICATE: u8 = 0b0000_0000;
+
+    // Representations
+    pub const INDEXED: u8 = 0b1000_0000;
+    pub const INDEXED_WITH_POST_BASE: u8 = 0b0001_0000;
+    pub const LITERAL: u8 = 0b0010_0000;
+    pub const LITERAL_WITH_NAME_REF: u8 = 0b0100_0000;
+
+    // Decoder instructions
+    pub const ACK: u8 = 0b1000_0000;
+    pub const STREAM_CANCEL: u8 = 0b0100_0000;
+    pub const COUNT_INCREMENT: u8 = 0b0000_0000;
+}
+
+mod enc_prefix {
+    pub const SET_CAPACITY: usize = 5;
+    pub const NAME_INDEX: usize = 6;
+    pub const NAME_LENGTH: usize = 5;
+    pub const VALUE_LENGTH: usize = 7;
+    pub const DUPLICATE_INDEX: usize = 5;
+}
+
+mod dec_prefix {
+    pub const SET_CAPACITY: usize = 5;
+    pub const NAME_INDEX: usize = 6;
+    pub const NAME_LENGTH: usize = 5;
+    pub const VALUE_LENGTH: usize = 7;
+    pub const DUPLICATE_INDEX: usize = 5;
+}
+
+mod rep_prefix {
+    pub const REQUIRED_INSERT_COUNT: usize = 8;
+    pub const BASE: usize = 7;
+    pub const FIELD_INDEX: usize = 6;// Field line index
+    pub const FIELD_INDEX_POST_BASE: usize = 4;// Field line index
+    pub const NAME_INDEX: usize = 4;
+    pub const NAME_INDEX_POST_BASE: usize = 3;
+    pub const NAME_LENGTH: usize = 3;
+    pub const VALUE_LENGTH: usize = 7;
+
+}
+
 
 /// A specialized [`Result`] type for quiche QPACK operations.
 ///
@@ -56,6 +99,14 @@ pub enum Error {
 
     /// The decoded header list exceeded the size limit.
     HeaderListTooLarge,
+
+    /// The decoder failed to interpret an encoder instruction received on the
+    /// encoder stream.
+    EncoderStreamError,
+
+    /// The encoder failed to interpret a decoder instruction received on the
+    /// decoder stream.
+    DecoderStreamError,
 }
 
 impl std::fmt::Display for Error {
@@ -103,6 +154,13 @@ mod tests {
 
         let mut dec = Decoder::new();
         assert_eq!(dec.decode(&mut encoded, std::u64::MAX), Ok(headers));
+
+        // capacity
+        let mut foo = [0u8; 240];
+        enc.set_max_table_capacity(1234);
+        assert_eq!(enc.capacity_instruction(&mut foo), Ok(()));
+
+        assert_eq!(dec.control(&mut foo), Ok(1234));
     }
 }
 

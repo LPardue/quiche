@@ -31,10 +31,40 @@ use super::Result;
 
 use crate::h3::Header;
 
-use super::INDEXED;
-use super::INDEXED_WITH_POST_BASE;
-use super::LITERAL;
-use super::LITERAL_WITH_NAME_REF;
+use super::enc_prefix;
+use super::rep_prefix;
+use super::start;
+
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum EncoderInstruction {
+    SetCapacity,
+    InsertWithNameRef,
+    InsertWithoutNameRef,
+    Duplicate,
+}
+
+impl EncoderInstruction {
+    pub fn from_byte(b: u8) -> Result<EncoderInstruction> {
+        if b & start::SET_CAPACITY == start::SET_CAPACITY {
+            return Ok(EncoderInstruction::SetCapacity);
+        }
+
+        if b & start::INSERT_WITH_NAME == start::INSERT_WITH_NAME {
+            return Ok(EncoderInstruction::InsertWithNameRef);
+        }
+
+        if b & start::INSERT_WITHOUT_NAME == start::INSERT_WITHOUT_NAME {
+            return Ok(EncoderInstruction::InsertWithoutNameRef);
+        }
+
+        if b & start::DUPLICATE == start::DUPLICATE {
+            return Ok(EncoderInstruction::Duplicate);
+        }
+
+        Err(Error::EncoderStreamError)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Representation {
@@ -47,19 +77,19 @@ enum Representation {
 
 impl Representation {
     pub fn from_byte(b: u8) -> Representation {
-        if b & INDEXED == INDEXED {
+        if b & start::INDEXED == start::INDEXED {
             return Representation::Indexed;
         }
 
-        if b & LITERAL_WITH_NAME_REF == LITERAL_WITH_NAME_REF {
+        if b & start::LITERAL_WITH_NAME_REF == start::LITERAL_WITH_NAME_REF {
             return Representation::LiteralWithNameRef;
         }
 
-        if b & LITERAL == LITERAL {
+        if b & start::LITERAL == start::LITERAL {
             return Representation::Literal;
         }
 
-        if b & INDEXED_WITH_POST_BASE == INDEXED_WITH_POST_BASE {
+        if b & start::INDEXED_WITH_POST_BASE == start::INDEXED_WITH_POST_BASE {
             return Representation::IndexedWithPostBase;
         }
 
@@ -83,9 +113,25 @@ impl Decoder {
     }
 
     /// Processes control instructions from the encoder.
-    pub fn control(&mut self, _buf: &mut [u8]) -> Result<()> {
+    pub fn control(&mut self, buf: &mut [u8]) -> Result<u64> {
         // TODO: process control instructions
-        Ok(())
+
+        let mut b = octets::Octets::with_slice(buf);
+
+        while b.cap() > 0 {
+            let first = b.peek_u8()?;
+
+            match EncoderInstruction::from_byte(first) {
+                Ok(EncoderInstruction::SetCapacity) => {
+                    let capacity = decode_int(&mut b, enc_prefix::SET_CAPACITY);
+                    return capacity;
+                },
+
+                _ => ()
+            }
+        }
+
+        Ok(0)
     }
 
     /// Decodes a QPACK header block into a list of headers.
@@ -96,8 +142,8 @@ impl Decoder {
 
         let mut left = max_size;
 
-        let req_insert_count = decode_int(&mut b, 8)?;
-        let base = decode_int(&mut b, 7)?;
+        let req_insert_count = decode_int(&mut b, rep_prefix::REQUIRED_INSERT_COUNT)?;
+        let base = decode_int(&mut b, rep_prefix::BASE)?;
 
         trace!("Header count={} base={}", req_insert_count, base);
 
@@ -106,10 +152,10 @@ impl Decoder {
 
             match Representation::from_byte(first) {
                 Representation::Indexed => {
-                    const STATIC: u8 = 0x40;
+                    const STATIC: u8 = 0b0100_0000;
 
                     let s = first & STATIC == STATIC;
-                    let index = decode_int(&mut b, 6)?;
+                    let index = decode_int(&mut b, rep_prefix::FIELD_INDEX)?;
 
                     trace!("Indexed index={} static={}", index, s);
 
@@ -128,7 +174,7 @@ impl Decoder {
                 },
 
                 Representation::IndexedWithPostBase => {
-                    let index = decode_int(&mut b, 4)?;
+                    let index = decode_int(&mut b, rep_prefix::NAME_INDEX_POST_BASE)?;
 
                     trace!("Indexed With Post Base index={}", index);
 
@@ -137,19 +183,9 @@ impl Decoder {
                 },
 
                 Representation::Literal => {
-                    let name_huff = b.as_ref()[0] & 0x08 == 0x08;
-                    let name_len = decode_int(&mut b, 3)? as usize;
+                    let name = decode_str(&mut b, true)?;
 
-                    let mut name = b.get_bytes(name_len)?;
-                    let name = if name_huff {
-                        super::huffman::decode(&mut name)?
-                    } else {
-                        name.to_vec()
-                    };
-
-                    let name = String::from_utf8(name)
-                        .map_err(|_| Error::InvalidHeaderValue)?;
-                    let value = decode_str(&mut b)?;
+                    let value = decode_str(&mut b, false)?;
 
                     trace!(
                         "Literal Without Name Reference name={:?} value={:?}",
@@ -165,11 +201,11 @@ impl Decoder {
                 },
 
                 Representation::LiteralWithNameRef => {
-                    const STATIC: u8 = 0x10;
+                    const STATIC: u8 = 0b0001_0000;
 
                     let s = first & STATIC == STATIC;
-                    let name_idx = decode_int(&mut b, 4)?;
-                    let value = decode_str(&mut b)?;
+                    let name_idx = decode_int(&mut b, rep_prefix::NAME_INDEX)?;
+                    let value = decode_str(&mut b, false)?;
 
                     trace!(
                         "Literal name_idx={} static={} value={:?}",
@@ -337,7 +373,7 @@ fn decode_int(b: &mut octets::Octets, prefix: usize) -> Result<u64> {
     while b.cap() > 0 {
         let byte = b.get_u8()?;
 
-        let inc = u64::from(byte & 0x7f)
+        let inc = u64::from(byte & 0b0111_1111)
             .checked_shl(shift)
             .ok_or(Error::BufferTooShort)?;
 
@@ -345,7 +381,7 @@ fn decode_int(b: &mut octets::Octets, prefix: usize) -> Result<u64> {
 
         shift += 7;
 
-        if byte & 0x80 == 0 {
+        if byte & 0b1000_0000 == 0 {
             return Ok(val);
         }
     }
@@ -353,12 +389,18 @@ fn decode_int(b: &mut octets::Octets, prefix: usize) -> Result<u64> {
     Err(Error::BufferTooShort)
 }
 
-fn decode_str<'a>(b: &'a mut octets::Octets) -> Result<String> {
+fn decode_str<'a>(b: &'a mut octets::Octets, name: bool) -> Result<String> {
     let first = b.peek_u8()?;
 
-    let huff = first & 0x80 == 0x80;
+    let (huff_mask, prefix) = if name {
+        (0b0000_1000, 3)
+    } else {
+        (0b1000_0000, 7)
+    };
 
-    let len = decode_int(b, 7)? as usize;
+    let huff = first & huff_mask == huff_mask;
+
+    let len = decode_int(b, prefix)? as usize;
 
     let mut val = b.get_bytes(len)?;
 
@@ -380,7 +422,7 @@ mod tests {
 
     #[test]
     fn decode_int1() {
-        let mut encoded = [0b01010, 0x02];
+        let mut encoded = [0b01010, 0b00010];
         let mut b = octets::Octets::with_slice(&mut encoded);
 
         assert_eq!(decode_int(&mut b, 5), Ok(10));
