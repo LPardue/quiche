@@ -428,6 +428,14 @@ impl Stream {
         Ok(frame)
     }
 
+    // TODO LP
+    pub fn try_consume_instruction(&mut self) -> Result<()> {
+
+
+
+        Ok(())
+    }
+
     /// Tries to read DATA payload from the transport stream.
     pub fn try_consume_data(
         &mut self, conn: &mut crate::Connection, out: &mut [u8],

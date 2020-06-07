@@ -70,7 +70,8 @@ fn main() {
         debug!("Got stream={} len={}", stream_id, len);
 
         if stream_id == 0 {
-            dec.control(&mut data[..len]).unwrap();
+            // TODO LP
+            //dec.control(&mut data[..len]).unwrap();
             continue;
         }
 
