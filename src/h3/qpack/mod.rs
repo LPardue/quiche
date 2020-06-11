@@ -84,22 +84,26 @@ enum EncInstruction {
 }
 
 impl EncInstruction {
-    pub fn from_byte(b: u8) -> Self {
+    pub fn from_byte(b: u8) -> Result<Self> {
+        if b == 0 {
+            return Err(Error::Done);
+        }
+
         // order of checks is important in order to avoid aliasing instruction
         // types
         if b & start::INSERT_WITH_NAME == start::INSERT_WITH_NAME {
-            return EncInstruction::InsertWithNameRef;
+            return Ok(EncInstruction::InsertWithNameRef);
         }
 
         if b & start::INSERT_WITHOUT_NAME == start::INSERT_WITHOUT_NAME {
-            return EncInstruction::InsertWithoutNameRef;
+            return Ok(EncInstruction::InsertWithoutNameRef);
         }
 
         if b & start::SET_CAPACITY == start::SET_CAPACITY {
-            return EncInstruction::SetCapacity;
+            return Ok(EncInstruction::SetCapacity);
         }
 
-        EncInstruction::Duplicate
+        Ok(EncInstruction::Duplicate)
 
         /*if b & start::HEADER_ACK == start::HEADER_ACK {
             return Ok(Instruction::HeaderAck);
@@ -123,17 +127,21 @@ enum DecInstruction {
 }
 
 impl DecInstruction {
-    pub fn from_byte(b: u8) -> Self {
+    pub fn from_byte(b: u8) -> Result<Self> {
+        if b == 0 {
+            return Err(Error::Done);
+        }
+
         if b & start::HEADER_ACK == start::HEADER_ACK {
-            return DecInstruction::HeaderAck;
+            return Ok(DecInstruction::HeaderAck);
         }
 
         if b & start::STREAM_CANCEL == start::STREAM_CANCEL {
-            return DecInstruction::StreamCancellation;
+            return Ok(DecInstruction::StreamCancellation);
         }
 
 
-        DecInstruction::InsertCountIncrement
+        Ok(DecInstruction::InsertCountIncrement)
     }
 }
 
@@ -218,6 +226,9 @@ pub enum Error {
     /// The encoder failed to interpret a decoder instruction received on the
     /// decoder stream.
     DecoderStreamError,
+
+    /// Decompression failed.
+    DecompressionFailed
 
 
 }
@@ -308,7 +319,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encode_decode() {
+    fn static_encode_decode() {
         let mut encoded = [0u8; 240];
 
         let headers = vec![
@@ -326,41 +337,142 @@ mod tests {
         let mut enc = Encoder::new();
         assert!(enc.encode(&headers, &mut encoded).is_ok());
 
-        let mut dec = Decoder::new();
+        let mut dec = Decoder::new(256);
         assert_eq!(dec.decode(&mut encoded, std::u64::MAX), Ok(headers));
+    }
 
-        // capacity
-        let mut foo = [0u8; 240];
+    #[test]
+    fn encoder_capacity_instr() {
+        let mut enc = Encoder::new();
+        let mut dec = Decoder::new(256);
+        let mut buf = [0u8; 24];
+
         enc.set_max_table_capacity(10);
-        assert_eq!(enc.capacity_instruction(&mut foo), Ok(()));
+        assert_eq!(enc.capacity_instruction(&mut buf), Ok(1));
+        assert_eq!(dec.control(&mut buf), Ok((1, Event::Capacity{v:10})));
 
-        assert_eq!(dec.control(&mut foo), Ok((1, Event::Capacity{v:10})));
+        // now send a bogus capacity
+        let mut enc = Encoder::new();
+        enc.set_max_table_capacity(1000);
+        assert_eq!(enc.capacity_instruction(&mut buf), Ok(3));
+        assert_eq!(dec.control(&mut buf), Err(h3::qpack::Error::EncoderStreamError));
 
-        // insert with name
-        let mut foo = [0u8; 240];
-        let hdr = h3::Header::new(":method", "GTFO");
-        enc.insert(&mut foo, &hdr, 15, true).unwrap();
-        assert_eq!(dec.control(&mut foo), Ok((6, Event::Header{v:hdr})));
+    }
+
+    #[test]
+    fn insert_with_name_instr() {
+        let enc = Encoder::new();
+        let mut dec = Decoder::new(256);
+        let mut buf = [0u8; 24];
+
+        let hdr = h3::Header::new(":method", "HELP");
+        assert_eq!(enc.insert(&mut buf, &hdr, 15, true), Ok(6));
+        assert_eq!(dec.control(&mut buf), Ok((6, Event::Header{v:hdr})));
+    }
+
+    #[test]
+    fn insert_without_name_instr() {
+        let enc = Encoder::new();
+        let mut dec = Decoder::new(256);
+        let mut buf = [0u8; 24];
 
         // insert without name (TODO the idx is weird here)
-        let mut foo = [0u8; 240];
         let hdr = h3::Header::new(":path", "thewrongpath");
-        enc.insert(&mut foo, &hdr, 1, false).unwrap();
+        assert_eq!(enc.insert(&mut buf, &hdr, 1, false), Ok(15));
+        assert_eq!(dec.control(&mut buf), Ok((15, Event::Header{v:hdr})));
+    }
 
-        assert_eq!(dec.control(&mut foo), Ok((15, Event::Header{v:hdr})));
+    #[test]
+    fn duplicate() {
+        let enc = Encoder::new();
+        let mut dec = Decoder::new(256);
+        let mut buf = [0u8; 24];
 
         // duplicate (TODO we should really check it duplicated an entry or something)
-        let mut foo = [0u8; 240];
-        enc.duplicate(&mut foo, 5).unwrap();
+        assert_eq!(enc.duplicate(&mut buf, 5), Ok(1));
+        assert_eq!(dec.control(&mut buf), Ok((1, Event::Duplicate{v:5})));
+    }
 
-        //assert_eq!(dec.control(&mut foo), Ok(Event::Duplicate{v:5}));
+    #[test]
+    fn encoder_instructions_batched() {
+        let enc = Encoder::new();
+        let mut dec = Decoder::new(256);
+
+        // combine several instructions into this single buffer
+        let mut buf = [0u8; 24];
+
+        let mut off= 0;
+
+        off += enc.capacity_instruction(&mut buf[off..]).unwrap();
+
+        let hdr = h3::Header::new(":method", "HELP");
+        off += enc.insert(&mut buf[off..], &hdr, 15, true).unwrap();
+
+        let hdr = h3::Header::new(":path", "thewrongpath");
+        off += enc.insert(&mut buf[off..], &hdr, 1, false).unwrap();
+
+        off += enc.duplicate(&mut buf[off..], 5).unwrap();
+
+        off = 0;
+        let (size, _) = dec.control(&mut buf[off..]).unwrap();
+
+        off += size;
+        let (size, _) = dec.control(&mut buf[off..]).unwrap();
+
+        off += size;
+        let (size, _) = dec.control(&mut buf[off..]).unwrap();
+
+        off += size;
+        let (size, _) = dec.control(&mut buf[off..]).unwrap();
+
+        off += size;
+        assert_eq!(dec.control(&mut buf[off..]), Err(h3::qpack::Error::Done));
+    }
+
+    #[test]
+    fn decoder_instructions() {
+        let mut enc = Encoder::new();
+        let dec = Decoder::new(256);
+        let mut buf = [0u8; 24];
 
         // header ack
-        let mut foo = [0u8; 240];
-        dec.header_ack(&mut foo, 123);
-        assert_eq!(enc.control(&mut foo), Ok(Event::HeaderAck{v:123}));
+        assert_eq!(dec.header_ack(&mut buf, 123), Ok(1));
+        assert_eq!(enc.control(&mut buf), Ok((1, Event::HeaderAck{v:123})));
 
-        // TODO mutliple instructions in one buffer
+        // stream cancellation
+        assert_eq!(dec.stream_cancel(&mut buf, 456), Ok(3));
+        assert_eq!(enc.control(&mut buf), Ok((3, Event::StreamCancellation{v:456})));
+
+        // insert count increment
+        assert_eq!(dec.insert_count_increment(&mut buf, 789), Ok(3));
+        assert_eq!(enc.control(&mut buf), Ok((3, Event::InsertCountIncrement{v:789})));
+    }
+
+    #[test]
+    fn decoder_instructions_batched() {
+        let mut enc = Encoder::new();
+        let dec = Decoder::new(256);
+
+        // combine several instructions into this single buffer
+        let mut buf = [0u8; 24];
+
+        let mut off= 0;
+
+        off += dec.header_ack(&mut buf[off..], 123).unwrap();
+        off += dec.stream_cancel(&mut buf[off..], 456).unwrap();
+        off += dec.insert_count_increment(&mut buf[off..], 789).unwrap();
+
+        off = 0;
+        let (size, _) = enc.control(&mut buf[off..]).unwrap();
+
+        off += size;
+        let (size, _) = enc.control(&mut buf[off..]).unwrap();
+
+        off += size;
+        let (size, _) = enc.control(&mut buf[off..]).unwrap();
+
+        off += size;
+        assert_eq!(enc.control(&mut buf[off..]), Err(h3::qpack::Error::Done));
     }
 }
 

@@ -61,64 +61,66 @@ impl Encoder {
         self.chosen_capacity = capacity;
     }
 
-    pub fn capacity_instruction(&self, out: &mut [u8]) -> Result<()> {
+    pub fn capacity_instruction(&self, out: &mut [u8]) -> Result<usize> {
         let mut b = octets::OctetsMut::with_slice(out);
         encode_int(self.chosen_capacity, start::SET_CAPACITY, enc_prefix::SET_CAPACITY, &mut b)?;
-        Ok(())
+        Ok(b.off())
     }
 
-    pub fn insert(&self, out: &mut [u8], hdr: &Header, idx: u64, with_name: bool) -> Result<()> {
+    pub fn insert(&self, out: &mut [u8], hdr: &Header, idx: u64, with_name: bool) -> Result<usize> {
         let mut b = octets::OctetsMut::with_slice(out);
 
         if with_name {
             const STATIC: u8 = 0b0100_0000;
             encode_int(idx, start::INSERT_WITH_NAME | STATIC, enc_prefix::NAME_INDEX, &mut b)?;
             encode_value_str(&hdr.1, &mut b)?;
-            return Ok(());
+            return Ok(b.off());
         }
 
         encode_name_str(&hdr.0, &mut b, start::INSERT_WITHOUT_NAME)?;
         encode_value_str(&hdr.1, &mut b)?;
 
-        Ok(())
+        Ok(b.off())
     }
 
-    pub fn duplicate(&self, out: &mut [u8], idx: u64) -> Result<()> {
+    pub fn duplicate(&self, out: &mut [u8], idx: u64) -> Result<usize> {
         let mut b = octets::OctetsMut::with_slice(out);
         encode_int(idx, start::DUPLICATE, enc_prefix::DUPLICATE_INDEX, &mut b)?;
-        Ok(())
+        Ok(b.off())
     }
 
     /// Processes control instructions from the decoder.
-    pub fn control(&mut self, buf: &mut [u8]) -> Result<Event> {
+    pub fn control(&mut self, buf: &mut [u8]) -> Result<(usize, Event)> {
         let mut b = octets::Octets::with_slice(buf);
 
         let first = b.peek_u8()?;
 
         match DecInstruction::from_byte(first) {
-            DecInstruction::HeaderAck => {
+            Ok(DecInstruction::HeaderAck) => {
                 let stream_id = decode_int(&mut b, dec_prefix::HEADER_ACK)?;
 
                 trace!("HeaderAck value={}", stream_id);
 
-                Ok(Event::HeaderAck{v:stream_id})
+                Ok((b.off(), Event::HeaderAck{v:stream_id}))
             },
 
-            DecInstruction::StreamCancellation => {
+            Ok(DecInstruction::StreamCancellation) => {
                 let stream_id = decode_int(&mut b, dec_prefix::STREAM_CANCEL)?;
 
                 trace!("StreamCancellation value={}", stream_id);
 
-                Ok(Event::StreamCancellation{v:stream_id})
+                Ok((b.off(), Event::StreamCancellation{v:stream_id}))
             },
 
-            DecInstruction::InsertCountIncrement => {
+            Ok(DecInstruction::InsertCountIncrement) => {
                 let incr = decode_int(&mut b, dec_prefix::INSERT_COUNT_INCREMENT)?;
 
                 trace!("InsertCountIncrement value={}", incr);
 
-                Ok(Event::InsertCountIncrement{v:incr})
+                Ok((b.off(), Event::InsertCountIncrement{v:incr}))
             },
+
+            Err(e) => Err(e)
         }
     }
 

@@ -47,7 +47,11 @@ fn main() {
 
     let mut file = File::open(&args.next().unwrap()).unwrap();
 
-    let mut dec = qpack::Decoder::new();
+    let mut dec = qpack::Decoder::new(256);
+
+    env_logger::builder()
+        .default_format_timestamp_nanos(true)
+        .init();
 
     loop {
         let mut stream_id: [u8; 8] = [0; 8];
@@ -70,15 +74,30 @@ fn main() {
         debug!("Got stream={} len={}", stream_id, len);
 
         if stream_id == 0 {
-            // TODO LP
-            //dec.control(&mut data[..len]).unwrap();
-            continue;
+            error!("read stream 0. len={}", len);
+            let mut off = 0;
+            while off < len {
+                match dec.control(&mut data[off..len]) {
+                    Ok((size, ev)) => {
+                        println!("Got {:?}, size={}", ev, size);
+                        off += size;
+                    },
+
+                    Err(quiche::h3::qpack::Error::Done) => {debug!("got done!"); break;},
+
+                    Err(e) => { error!("got {}", e); break;},
+
+
+                }
+            }
+
+        } else {
+
+            for hdr in dec.decode(&data[..len], std::u64::MAX).unwrap() {
+                //println!("{}\t{}", hdr.name(), hdr.value());
+            }
         }
 
-        for hdr in dec.decode(&data[..len], std::u64::MAX).unwrap() {
-            println!("{}\t{}", hdr.name(), hdr.value());
-        }
-
-        println!();
+        //println!();
     }
 }

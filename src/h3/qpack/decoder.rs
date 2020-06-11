@@ -32,24 +32,41 @@ use super::Result;
 use super::*;
 
 /// A QPACK decoder.
-pub struct Decoder {}
+#[derive(Default)]
+pub struct Decoder {
+    max_table_capacity: u64,
+    advertised_capacity: u64,
 
-impl Default for Decoder {
-    fn default() -> Decoder {
-        Decoder {}
-    }
+    // TODO LP
+    total_inserts: u64,
 }
 
 impl Decoder {
     /// Creates a new QPACK decoder.
-    pub fn new() -> Decoder {
-        Decoder::default()
+    pub fn new(max_table_capacity: u64) -> Self {
+        Decoder {
+            max_table_capacity,
+            advertised_capacity: 0,
+            total_inserts: 0,
+        }
     }
 
-    pub fn header_ack(&self, out: &mut [u8], stream_id: u64) -> Result<()> {
+    pub fn header_ack(&self, out: &mut [u8], stream_id: u64) -> Result<usize> {
         let mut b = octets::OctetsMut::with_slice(out);
         encode_int(stream_id, start::HEADER_ACK, dec_prefix::HEADER_ACK, &mut b)?;
-        Ok(())
+        Ok(b.off())
+    }
+
+    pub fn stream_cancel(&self, out: &mut [u8], stream_id: u64) -> Result<usize> {
+        let mut b = octets::OctetsMut::with_slice(out);
+        encode_int(stream_id, start::STREAM_CANCEL, dec_prefix::STREAM_CANCEL, &mut b)?;
+        Ok(b.off())
+    }
+
+    pub fn insert_count_increment(&self, out: &mut [u8], stream_id: u64) -> Result<usize> {
+        let mut b = octets::OctetsMut::with_slice(out);
+        encode_int(stream_id, start::INSERT_COUNT_INCREMENT, dec_prefix::INSERT_COUNT_INCREMENT, &mut b)?;
+        Ok(b.off())
     }
 
     /// Processes control instructions from the encoder.
@@ -62,16 +79,21 @@ impl Decoder {
             let first = b.peek_u8()?;
 
             match EncInstruction::from_byte(first) {
-                EncInstruction::SetCapacity => {
+                Ok(EncInstruction::SetCapacity) => {
 
                     let capacity = decode_int(&mut b, enc_prefix::SET_CAPACITY)?;
 
                     trace!("SetCapacity value={}", capacity);
 
-                    Ok((b.off(),Event::Capacity{v:capacity}))
+                    if capacity <= self.max_table_capacity {
+                        self.advertised_capacity = capacity;
+                        return Ok((b.off(),Event::Capacity{v:capacity}));
+                    }
+
+                    Err(Error::EncoderStreamError)
                 },
 
-                EncInstruction::InsertWithNameRef => {
+                Ok(EncInstruction::InsertWithNameRef) => {
                     const STATIC: u8 = 0b0100_0000;
                     let s = first & STATIC == STATIC;
 
@@ -86,12 +108,16 @@ impl Decoder {
                     );
 
                     let (name, _) = lookup_static(name_idx)?;
+
+                    self.total_inserts += 1;
+
+
                     let hdr = Header::new(name, &value);
 
                     Ok((b.off(),Event::Header{v:hdr}))
                 },
 
-                EncInstruction::InsertWithoutNameRef => {
+                Ok(EncInstruction::InsertWithoutNameRef) => {
                     let name = decode_name_str(&mut b, enc_prefix::NAME_LENGTH)?;
                     let value = decode_value_str(&mut b)?;
 
@@ -101,18 +127,25 @@ impl Decoder {
                         value
                     );
 
+                    self.total_inserts += 1;
+
                     let hdr = Header::new(&name, &value);
 
                     Ok((b.off(),Event::Header{v:hdr}))
                 },
 
-                EncInstruction::Duplicate => {
+                Ok(EncInstruction::Duplicate) => {
                     let idx = decode_int(&mut b, enc_prefix::DUPLICATE_INDEX)?;
 
                     trace!("Duplicate index={}", idx);
 
+                    // todo LP increment inserts on dupe?
+                    self.total_inserts += 1;
+
                     Ok((b.off(),Event::Duplicate{v:idx}))
                 }
+
+                Err(e) => Err(e)
 
                 //_ => ()
             }
@@ -121,18 +154,74 @@ impl Decoder {
         //Err(Error::Done)
     }
 
+    fn decode_insert_count(&self, b: &mut octets::Octets) -> Result<u64> {
+        let encoded_insert_count = decode_int(b, rep_prefix::REQUIRED_INSERT_COUNT)?;
+
+        if encoded_insert_count == 0 {
+            return Ok(0);
+        }
+
+
+        let max_entries = self.max_table_capacity / 32;
+        let full_range = 2 * max_entries;
+
+        trace!("self.max_cap={} max_entries={} encoded_insert_count={} full_range={}", self.max_table_capacity, max_entries, encoded_insert_count, full_range);
+
+        if encoded_insert_count > full_range {
+            trace!("fudge 1");
+            return Err(Error::DecompressionFailed);
+        }
+
+        let max_value = self.total_inserts + max_entries;
+        let max_wrapped = (max_value / full_range) * full_range;
+        let mut req_insert_count = max_wrapped + encoded_insert_count -1;
+
+        if req_insert_count > max_value {
+            if req_insert_count <= full_range {
+                trace!("fudge 2");
+                return Err(Error::DecompressionFailed);
+            }
+            req_insert_count -= full_range;
+        }
+
+        if req_insert_count == 0 {
+            trace!("fudge 3");
+            return Err(Error::DecompressionFailed);
+        }
+
+        Ok(req_insert_count)
+    }
+
+    fn decode_base(b: &mut octets::Octets, required_insert_count: u64) -> Result<u64> {
+        let first = b.peek_u8()?;
+        let s = first & 0b1000_0000 == 0b1000_0000;
+
+        let delta_base = decode_int(b, rep_prefix::BASE)?;
+
+        let value = if s {
+            required_insert_count - delta_base - 1
+        } else {
+            required_insert_count + delta_base
+        };
+
+        Ok(value)
+    }
+
     /// Decodes a QPACK header block into a list of headers.
     pub fn decode(&mut self, buf: &[u8], max_size: u64) -> Result<Vec<Header>> {
+        trace!("decoding encoded field section");
         let mut b = octets::Octets::with_slice(buf);
 
         let mut out = Vec::new();
 
         let mut left = max_size;
 
-        let req_insert_count = decode_int(&mut b, rep_prefix::REQUIRED_INSERT_COUNT)?;
-        let base = decode_int(&mut b, rep_prefix::BASE)?;
+        //let encoded_insert_count = decode_int(&mut b, rep_prefix::REQUIRED_INSERT_COUNT)?;
 
-        trace!("Header count={} base={}", req_insert_count, base);
+        let req_insert_count = self.decode_insert_count(&mut b)?;
+        let base = Decoder::decode_base(&mut b, req_insert_count)?;
+
+        trace!("Header req_insert_count={} base={}", req_insert_count, base);
 
         while b.cap() > 0 {
             let first = b.peek_u8()?;
@@ -419,5 +508,28 @@ mod tests {
         let mut b = octets::Octets::with_slice(&mut encoded);
 
         assert_eq!(decode_int(&mut b, 8), Ok(42));
+    }
+
+    #[test]
+    fn decode_insert_count() {
+        // test case taken from QPACK, see
+        // https://tools.ietf.org/html/draft-ietf-quic-qpack-16#section-4.5.1.1
+        let mut decoder = Decoder::new(100);
+        decoder.total_inserts = 10;
+
+        let mut encoded = [0b00100];
+        let mut b = octets::Octets::with_slice(&mut encoded);
+        assert_eq!(decoder.decode_insert_count(&mut b).unwrap(), 9);
+    }
+
+    #[test]
+    fn decode_base() {
+        // test case taken from QPACK, see
+        // https://tools.ietf.org/html/draft-ietf-quic-qpack-16#section-4.5.1.2
+        let required_insert_count = 9;
+        let mut encoded = [0b1000_0010];
+
+        let mut b = octets::Octets::with_slice(&mut encoded);
+        assert_eq!(Decoder::decode_base(&mut b, required_insert_count).unwrap(), 6);
     }
 }

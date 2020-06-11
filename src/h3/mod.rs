@@ -544,7 +544,7 @@ impl Connection {
             peer_control_stream_id: None,
 
             qpack_encoder: qpack::Encoder::new(),
-            qpack_decoder: qpack::Decoder::new(),
+            qpack_decoder: qpack::Decoder::new(config.qpack_max_table_capacity.unwrap_or(0)),
 
             local_qpack_streams: QpackStreams {
                 encoder_stream_id: None,
