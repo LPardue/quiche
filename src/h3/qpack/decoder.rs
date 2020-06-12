@@ -107,7 +107,12 @@ impl Decoder {
                         value
                     );
 
-                    let (name, _) = lookup_static(name_idx)?;
+                    let (name, _) = if s {
+                        lookup_static(name_idx)?
+                    } else {
+                        error!("dynamic name ref not support");
+                        panic!("dammit");
+                    };
 
                     self.total_inserts += 1;
 
