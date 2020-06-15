@@ -31,6 +31,12 @@ use super::Result;
 
 use super::*;
 
+struct TableEntry {
+    base: u64,
+    hdr: Header,
+    refs: u64,
+}
+
 /// A QPACK decoder.
 #[derive(Default)]
 pub struct Decoder {
