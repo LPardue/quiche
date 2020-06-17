@@ -83,21 +83,23 @@ fn main() {
                         off += size;
                     },
 
-                    Err(quiche::h3::qpack::Error::Done) => {debug!("got done!"); break;},
+                    Err(quiche::h3::qpack::Error::Done) => {
+                        debug!("got done!");
+                        break;
+                    },
 
-                    Err(e) => { error!("got {}", e); break;},
-
-
+                    Err(e) => {
+                        error!("got {}", e);
+                        break;
+                    },
                 }
             }
-
         } else {
-
             for hdr in dec.decode(&data[..len], std::u64::MAX).unwrap() {
-                //println!("{}\t{}", hdr.name(), hdr.value());
+                // println!("{}\t{}", hdr.name(), hdr.value());
             }
         }
 
-        //println!();
+        // println!();
     }
 }

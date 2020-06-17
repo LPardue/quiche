@@ -24,6 +24,8 @@
 // NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+use std::collections::VecDeque;
+
 use crate::octets;
 
 use super::Error;
@@ -31,7 +33,8 @@ use super::Result;
 
 use super::*;
 
-struct TableEntry {
+#[derive(Clone)]
+pub struct TableEntry {
     base: u64,
     hdr: Header,
     refs: u64,
@@ -44,7 +47,9 @@ pub struct Decoder {
     advertised_capacity: u64,
 
     // TODO LP
-    total_inserts: u64,
+    base: u64,
+
+    dynamic: VecDeque<TableEntry>,
 }
 
 impl Decoder {
@@ -53,8 +58,44 @@ impl Decoder {
         Decoder {
             max_table_capacity,
             advertised_capacity: 0,
-            total_inserts: 0,
+            base: 0,
+            dynamic: VecDeque::new(),
         }
+    }
+
+    fn lookup_dynamic_with_absolute_index(&mut self, index: u64) -> Result<&mut TableEntry> {
+
+        let index = self.base - index - 1;
+        if index as usize >= self.dynamic.len() {
+            trace!("Index out of bounds {}", index);
+            return Err(Error::DecompressionFailed);
+        }
+        Ok(&mut self.dynamic[index as usize])
+    }
+
+    fn lookup_dynamic_relative_index(&self, index: u64) -> Result<&TableEntry> {
+        if index as usize >= self.dynamic.len() {
+            trace!("Index out of bounds {}", index);
+            return Err(Error::DecompressionFailed);
+        }
+
+        Ok(&self.dynamic[index as usize])
+    }
+
+    pub fn lookup_dynamic(&self, index: u64, base: u64, post_base: bool) -> Result<&TableEntry> {
+        let index = if post_base {
+            if self.base < (base + index + 1) {
+                return Err(Error::DecompressionFailed);
+            }
+            self.base - (base + index + 1)
+        } else {
+            if (self.base + index) < base {
+                return Err(Error::DecompressionFailed);
+            }
+            (self.base + index) - base
+        };
+
+        self.lookup_dynamic_relative_index(index)
     }
 
     pub fn header_ack(&self, out: &mut [u8], stream_id: u64) -> Result<usize> {
@@ -65,113 +106,146 @@ impl Decoder {
 
     pub fn stream_cancel(&self, out: &mut [u8], stream_id: u64) -> Result<usize> {
         let mut b = octets::OctetsMut::with_slice(out);
-        encode_int(stream_id, start::STREAM_CANCEL, dec_prefix::STREAM_CANCEL, &mut b)?;
+        encode_int(
+            stream_id,
+            start::STREAM_CANCEL,
+            dec_prefix::STREAM_CANCEL,
+            &mut b,
+        )?;
         Ok(b.off())
     }
 
-    pub fn insert_count_increment(&self, out: &mut [u8], stream_id: u64) -> Result<usize> {
+    pub fn insert_count_increment(
+        &self, out: &mut [u8], stream_id: u64,
+    ) -> Result<usize> {
         let mut b = octets::OctetsMut::with_slice(out);
-        encode_int(stream_id, start::INSERT_COUNT_INCREMENT, dec_prefix::INSERT_COUNT_INCREMENT, &mut b)?;
+        encode_int(
+            stream_id,
+            start::INSERT_COUNT_INCREMENT,
+            dec_prefix::INSERT_COUNT_INCREMENT,
+            &mut b,
+        )?;
         Ok(b.off())
     }
 
     /// Processes control instructions from the encoder.
-    pub fn control(&mut self, buf: &mut [u8]) -> Result<(usize,Event)> {
+    pub fn control(&mut self, buf: &mut [u8]) -> Result<(usize, Event)> {
         // TODO: process control instructions
 
         let mut b = octets::Octets::with_slice(buf);
 
-        //while b.cap() > 0 {
-            let first = b.peek_u8()?;
+        // while b.cap() > 0 {
+        let first = b.peek_u8()?;
 
-            match EncInstruction::from_byte(first) {
-                Ok(EncInstruction::SetCapacity) => {
+        match EncInstruction::from_byte(first) {
+            Ok(EncInstruction::SetCapacity) => {
+                let capacity = decode_int(&mut b, enc_prefix::SET_CAPACITY)?;
 
-                    let capacity = decode_int(&mut b, enc_prefix::SET_CAPACITY)?;
+                trace!("SetCapacity value={}", capacity);
 
-                    trace!("SetCapacity value={}", capacity);
-
-                    if capacity <= self.max_table_capacity {
-                        self.advertised_capacity = capacity;
-                        return Ok((b.off(),Event::Capacity{v:capacity}));
-                    }
-
-                    Err(Error::EncoderStreamError)
-                },
-
-                Ok(EncInstruction::InsertWithNameRef) => {
-                    const STATIC: u8 = 0b0100_0000;
-                    let s = first & STATIC == STATIC;
-
-                    let name_idx = decode_int(&mut b, enc_prefix::NAME_INDEX)?;
-                    let value = decode_value_str(&mut b)?;
-
-                    trace!(
-                        "InsertWithNameRef name_idx={} static={} value={:?}",
-                        name_idx,
-                        s,
-                        value
-                    );
-
-                    let (name, _) = if s {
-                        lookup_static(name_idx)?
-                    } else {
-                        error!("dynamic name ref not support");
-                        panic!("dammit");
-                    };
-
-                    self.total_inserts += 1;
-
-
-                    let hdr = Header::new(name, &value);
-
-                    Ok((b.off(),Event::Header{v:hdr}))
-                },
-
-                Ok(EncInstruction::InsertWithoutNameRef) => {
-                    let name = decode_name_str(&mut b, enc_prefix::NAME_LENGTH)?;
-                    let value = decode_value_str(&mut b)?;
-
-                    trace!(
-                        "InsertWithoutNameRef name={:?} value={:?}",
-                        name,
-                        value
-                    );
-
-                    self.total_inserts += 1;
-
-                    let hdr = Header::new(&name, &value);
-
-                    Ok((b.off(),Event::Header{v:hdr}))
-                },
-
-                Ok(EncInstruction::Duplicate) => {
-                    let idx = decode_int(&mut b, enc_prefix::DUPLICATE_INDEX)?;
-
-                    trace!("Duplicate index={}", idx);
-
-                    // todo LP increment inserts on dupe?
-                    self.total_inserts += 1;
-
-                    Ok((b.off(),Event::Duplicate{v:idx}))
+                if capacity <= self.max_table_capacity {
+                    self.advertised_capacity = capacity;
+                    return Ok((b.off(), Event::Capacity { v: capacity }));
                 }
 
-                Err(e) => Err(e)
+                Err(Error::EncoderStreamError)
+            },
 
-                //_ => ()
-            }
+            Ok(EncInstruction::InsertWithNameRef) => {
+                const STATIC: u8 = 0b0100_0000;
+                let s = first & STATIC == STATIC;
+
+                let name_idx = decode_int(&mut b, enc_prefix::NAME_INDEX)?;
+                let value = decode_value_str(&mut b)?;
+
+                let (name, _) = if s {
+                    lookup_static(name_idx)?
+                } else {
+                    let name = self.lookup_dynamic(name_idx, self.base, false)?.hdr.name();
+                    (name, "")
+
+                    //error!("dynamic name ref not support");
+                    //panic!("dammit");
+                };
+
+                trace!(
+                    "InsertWithNameRef name_idx={} static={} name={} value={:?}",
+                    name_idx,
+                    s,
+                    name,
+                    value
+                );
+
+                let hdr = Header::new(name, &value);
+
+                // TODO LP validate table has enough space first, don't
+                // clone the header to return an event
+                self.dynamic.push_front(TableEntry {
+                    base: 0,
+                    hdr: hdr.clone(),
+                    refs: 0,
+                });
+
+                self.base += 1;
+
+                Ok((b.off(), Event::Header { v: hdr }))
+            },
+
+            Ok(EncInstruction::InsertWithoutNameRef) => {
+                let name = decode_name_str(&mut b, enc_prefix::NAME_LENGTH)?;
+                let value = decode_value_str(&mut b)?;
+
+                trace!("InsertWithoutNameRef name={:?} value={:?}", name, value);
+
+                let hdr = Header::new(&name, &value);
+
+                // TODO LP validate table has enough space first, don't
+                // clone the header to return an event
+                self.dynamic.push_front(TableEntry {
+                    base: 0,
+                    hdr: hdr.clone(),
+                    refs: 0,
+                });
+
+                self.base += 1;
+
+                Ok((b.off(), Event::Header { v: hdr }))
+            },
+
+            Ok(EncInstruction::Duplicate) => {
+                let idx = decode_int(&mut b, enc_prefix::DUPLICATE_INDEX)?;
+
+                trace!("Duplicate index={}", idx);
+
+                // clone to avoid double mutable reference
+                let hdr = self.lookup_dynamic(idx, self.base, false)?.hdr.clone();
+
+                // TODO LP validate table has enough space first
+                self.dynamic.push_front(TableEntry {
+                    base: 0,
+                    hdr,
+                    refs: 0,
+                });
+
+                self.base += 1;
+
+                Ok((b.off(), Event::Duplicate { v: idx }))
+            },
+
+            Err(e) => Err(e), //_ => ()
+        }
         //}
 
-        //Err(Error::Done)
+        // Err(Error::Done)
     }
 
     fn decode_insert_count(&self, b: &mut octets::Octets) -> Result<u64> {
-        let encoded_insert_count = decode_int(b, rep_prefix::REQUIRED_INSERT_COUNT)?;
+        let encoded_insert_count =
+            decode_int(b, rep_prefix::REQUIRED_INSERT_COUNT)?;
 
         if encoded_insert_count == 0 {
             return Ok(0);
         }
-
 
         let max_entries = self.max_table_capacity / 32;
         let full_range = 2 * max_entries;
@@ -183,9 +257,9 @@ impl Decoder {
             return Err(Error::DecompressionFailed);
         }
 
-        let max_value = self.total_inserts + max_entries;
+        let max_value = self.base + max_entries;
         let max_wrapped = (max_value / full_range) * full_range;
-        let mut req_insert_count = max_wrapped + encoded_insert_count -1;
+        let mut req_insert_count = max_wrapped + encoded_insert_count - 1;
 
         if req_insert_count > max_value {
             if req_insert_count <= full_range {
@@ -203,7 +277,9 @@ impl Decoder {
         Ok(req_insert_count)
     }
 
-    fn decode_base(b: &mut octets::Octets, required_insert_count: u64) -> Result<u64> {
+    fn decode_base(
+        b: &mut octets::Octets, required_insert_count: u64,
+    ) -> Result<u64> {
         let first = b.peek_u8()?;
         let s = first & 0b1000_0000 == 0b1000_0000;
 
@@ -227,7 +303,8 @@ impl Decoder {
 
         let mut left = max_size;
 
-        //let encoded_insert_count = decode_int(&mut b, rep_prefix::REQUIRED_INSERT_COUNT)?;
+        // let encoded_insert_count = decode_int(&mut b,
+        // rep_prefix::REQUIRED_INSERT_COUNT)?;
 
         let req_insert_count = self.decode_insert_count(&mut b)?;
         let base = Decoder::decode_base(&mut b, req_insert_count)?;
@@ -246,27 +323,35 @@ impl Decoder {
 
                     trace!("Indexed index={} static={}", index, s);
 
-                    if !s {
-                        // TODO: implement dynamic table
-                        return Err(Error::InvalidHeaderValue);
-                    }
-
-                    let (name, value) = lookup_static(index)?;
+                    let hdr = if s {
+                        let (name, value) = lookup_static(index)?;
+                        Header::new(&name, &value)
+                    } else {
+                        // TODO LP: implement dynamic table
+                        let hdr =
+                            self.lookup_dynamic(index, self.base, false)?.hdr.clone();
+                        hdr
+                        //return Err(Error::InvalidHeaderValue);
+                    };
 
                     left = left
-                        .checked_sub((name.len() + value.len()) as u64)
+                        .checked_sub((hdr.name().len() + hdr.value().len()) as u64)
                         .ok_or(Error::HeaderListTooLarge)?;
 
-                    out.push(Header::new(&name, &value));
+                    out.push(hdr);
                 },
 
                 Representation::IndexedWithPostBase => {
-                    let index = decode_int(&mut b, rep_prefix::NAME_INDEX_POST_BASE)?;
+                    let index =
+                        decode_int(&mut b, rep_prefix::NAME_INDEX_POST_BASE)?;
 
                     trace!("Indexed With Post Base index={}", index);
 
-                    // TODO: implement dynamic table
-                    return Err(Error::InvalidHeaderValue);
+                    // TODO LP: implement dynamic table
+                    //return Err(Error::InvalidHeaderValue);
+                    let hdr = self.lookup_dynamic(index, self.base, true)?.hdr.clone();
+                    out.push(hdr);
+
                 },
 
                 Representation::Literal => {
@@ -301,12 +386,15 @@ impl Decoder {
                         value
                     );
 
-                    if !s {
-                        // TODO: implement dynamic table
-                        return Err(Error::InvalidHeaderValue);
-                    }
+                    let (name, _) = if s {
+                        lookup_static(name_idx)?
+                    } else {
+                        let name = self.lookup_dynamic(name_idx, self.base, false)?.hdr.name();
+                        (name, "")
 
-                    let (name, _) = lookup_static(name_idx)?;
+                        //error!("dynamic name ref not support");
+                        //panic!("dammit");
+                    };
 
                     left = left
                         .checked_sub((name.len() + value.len()) as u64)
@@ -316,7 +404,15 @@ impl Decoder {
                 },
 
                 Representation::LiteralWithPostBase => {
-                    trace!("Literal With Post Base");
+                    let name_idx = decode_int(&mut b, rep_prefix::NAME_INDEX)?;
+                    let value = decode_value_str(&mut b)?;
+
+                    trace!(
+                        "Literal With Post Base name_idx={} value={:?}",
+                        name_idx,
+                        value
+                    );
+
 
                     // TODO: implement dynamic table
                     return Err(Error::InvalidHeaderValue);
@@ -445,7 +541,9 @@ fn lookup_static(idx: u64) -> Result<(&'static str, &'static str)> {
     Ok(hdr)
 }
 
-fn decode_name_str<'a>(b: &'a mut octets::Octets, prefix: usize) -> Result<String> {
+fn decode_name_str<'a>(
+    b: &'a mut octets::Octets, prefix: usize,
+) -> Result<String> {
     let first = b.peek_u8()?;
 
     let huff_mask = match prefix {
@@ -453,7 +551,7 @@ fn decode_name_str<'a>(b: &'a mut octets::Octets, prefix: usize) -> Result<Strin
 
         enc_prefix::NAME_LENGTH => 0b0010_0000,
 
-        _ => unreachable!()
+        _ => unreachable!(),
     };
 
     let huff = first & huff_mask == huff_mask;
@@ -526,7 +624,7 @@ mod tests {
         // test case taken from QPACK, see
         // https://tools.ietf.org/html/draft-ietf-quic-qpack-16#section-4.5.1.1
         let mut decoder = Decoder::new(100);
-        decoder.total_inserts = 10;
+        decoder.base = 10;
 
         let mut encoded = [0b00100];
         let mut b = octets::Octets::with_slice(&mut encoded);
@@ -541,6 +639,9 @@ mod tests {
         let mut encoded = [0b1000_0010];
 
         let mut b = octets::Octets::with_slice(&mut encoded);
-        assert_eq!(Decoder::decode_base(&mut b, required_insert_count).unwrap(), 6);
+        assert_eq!(
+            Decoder::decode_base(&mut b, required_insert_count).unwrap(),
+            6
+        );
     }
 }

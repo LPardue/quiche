@@ -66,14 +66,13 @@ mod dec_prefix {
 mod rep_prefix {
     pub const REQUIRED_INSERT_COUNT: usize = 8;
     pub const BASE: usize = 7;
-    pub const FIELD_INDEX: usize = 6;// Field line index
-    pub const FIELD_INDEX_POST_BASE: usize = 4;// Field line index
+    pub const FIELD_INDEX: usize = 6; // Field line index
+    pub const FIELD_INDEX_POST_BASE: usize = 4; // Field line index
     pub const NAME_INDEX: usize = 4;
     pub const NAME_INDEX_POST_BASE: usize = 3;
     pub const NAME_LENGTH: usize = 3;
     pub const VALUE_LENGTH: usize = 7;
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum EncInstruction {
@@ -105,18 +104,17 @@ impl EncInstruction {
 
         Ok(EncInstruction::Duplicate)
 
-        /*if b & start::HEADER_ACK == start::HEADER_ACK {
-            return Ok(Instruction::HeaderAck);
-        }
-
-        if b & start::STREAM_CANCEL == start::STREAM_CANCEL {
-            return Ok(Instruction::StreamCancellation);
-        }
-
-        if b == 0 {
-            return Ok(Instruction::InsertCountIncrement);
-        }*/
-
+        // if b & start::HEADER_ACK == start::HEADER_ACK {
+        // return Ok(Instruction::HeaderAck);
+        // }
+        //
+        // if b & start::STREAM_CANCEL == start::STREAM_CANCEL {
+        // return Ok(Instruction::StreamCancellation);
+        // }
+        //
+        // if b == 0 {
+        // return Ok(Instruction::InsertCountIncrement);
+        // }
     }
 }
 
@@ -139,7 +137,6 @@ impl DecInstruction {
         if b & start::STREAM_CANCEL == start::STREAM_CANCEL {
             return Ok(DecInstruction::StreamCancellation);
         }
-
 
         Ok(DecInstruction::InsertCountIncrement)
     }
@@ -177,17 +174,17 @@ impl Representation {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
-    Capacity { v: u64},
+    Capacity { v: u64 },
 
-    Header { v: Header},
+    Header { v: Header },
 
-    Duplicate { v: u64},
+    Duplicate { v: u64 },
 
-    HeaderAck { v: u64},
+    HeaderAck { v: u64 },
 
-    StreamCancellation { v: u64},
+    StreamCancellation { v: u64 },
 
-    InsertCountIncrement { v: u64},
+    InsertCountIncrement { v: u64 },
 }
 
 /// A specialized [`Result`] type for quiche QPACK operations.
@@ -228,9 +225,7 @@ pub enum Error {
     DecoderStreamError,
 
     /// Decompression failed.
-    DecompressionFailed
-
-
+    DecompressionFailed,
 }
 
 impl std::fmt::Display for Error {
@@ -279,7 +274,6 @@ fn encode_int(
 
     Ok(())
 }
-
 
 fn decode_int(b: &mut octets::Octets, prefix: usize) -> Result<u64> {
     let mask = 2u64.pow(prefix as u32) - 1;
@@ -349,14 +343,16 @@ mod tests {
 
         enc.set_max_table_capacity(10);
         assert_eq!(enc.capacity_instruction(&mut buf), Ok(1));
-        assert_eq!(dec.control(&mut buf), Ok((1, Event::Capacity{v:10})));
+        assert_eq!(dec.control(&mut buf), Ok((1, Event::Capacity { v: 10 })));
 
         // now send a bogus capacity
         let mut enc = Encoder::new();
         enc.set_max_table_capacity(1000);
         assert_eq!(enc.capacity_instruction(&mut buf), Ok(3));
-        assert_eq!(dec.control(&mut buf), Err(h3::qpack::Error::EncoderStreamError));
-
+        assert_eq!(
+            dec.control(&mut buf),
+            Err(h3::qpack::Error::EncoderStreamError)
+        );
     }
 
     #[test]
@@ -367,7 +363,7 @@ mod tests {
 
         let hdr = h3::Header::new(":method", "HELP");
         assert_eq!(enc.insert(&mut buf, &hdr, 15, true), Ok(6));
-        assert_eq!(dec.control(&mut buf), Ok((6, Event::Header{v:hdr})));
+        assert_eq!(dec.control(&mut buf), Ok((6, Event::Header { v: hdr })));
     }
 
     #[test]
@@ -379,7 +375,7 @@ mod tests {
         // insert without name (TODO the idx is weird here)
         let hdr = h3::Header::new(":path", "thewrongpath");
         assert_eq!(enc.insert(&mut buf, &hdr, 1, false), Ok(15));
-        assert_eq!(dec.control(&mut buf), Ok((15, Event::Header{v:hdr})));
+        assert_eq!(dec.control(&mut buf), Ok((15, Event::Header { v: hdr })));
     }
 
     #[test]
@@ -388,9 +384,10 @@ mod tests {
         let mut dec = Decoder::new(256);
         let mut buf = [0u8; 24];
 
-        // duplicate (TODO we should really check it duplicated an entry or something)
+        // duplicate (TODO we should really check it duplicated an entry or
+        // something)
         assert_eq!(enc.duplicate(&mut buf, 5), Ok(1));
-        assert_eq!(dec.control(&mut buf), Ok((1, Event::Duplicate{v:5})));
+        assert_eq!(dec.control(&mut buf), Ok((1, Event::Duplicate { v: 5 })));
     }
 
     #[test]
@@ -401,7 +398,7 @@ mod tests {
         // combine several instructions into this single buffer
         let mut buf = [0u8; 24];
 
-        let mut off= 0;
+        let mut off = 0;
 
         off += enc.capacity_instruction(&mut buf[off..]).unwrap();
 
@@ -437,15 +434,21 @@ mod tests {
 
         // header ack
         assert_eq!(dec.header_ack(&mut buf, 123), Ok(1));
-        assert_eq!(enc.control(&mut buf), Ok((1, Event::HeaderAck{v:123})));
+        assert_eq!(enc.control(&mut buf), Ok((1, Event::HeaderAck { v: 123 })));
 
         // stream cancellation
         assert_eq!(dec.stream_cancel(&mut buf, 456), Ok(3));
-        assert_eq!(enc.control(&mut buf), Ok((3, Event::StreamCancellation{v:456})));
+        assert_eq!(
+            enc.control(&mut buf),
+            Ok((3, Event::StreamCancellation { v: 456 }))
+        );
 
         // insert count increment
         assert_eq!(dec.insert_count_increment(&mut buf, 789), Ok(3));
-        assert_eq!(enc.control(&mut buf), Ok((3, Event::InsertCountIncrement{v:789})));
+        assert_eq!(
+            enc.control(&mut buf),
+            Ok((3, Event::InsertCountIncrement { v: 789 }))
+        );
     }
 
     #[test]
@@ -456,7 +459,7 @@ mod tests {
         // combine several instructions into this single buffer
         let mut buf = [0u8; 24];
 
-        let mut off= 0;
+        let mut off = 0;
 
         off += dec.header_ack(&mut buf[off..], 123).unwrap();
         off += dec.stream_cancel(&mut buf[off..], 456).unwrap();

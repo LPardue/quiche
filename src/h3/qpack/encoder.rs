@@ -32,7 +32,6 @@ use crate::h3::Header;
 
 use super::*;
 
-
 /// A QPACK encoder.
 
 #[derive(Default)]
@@ -46,7 +45,7 @@ impl Encoder {
     pub fn new() -> Encoder {
         Encoder {
             max_table_capacity: None,
-            chosen_capacity: 0
+            chosen_capacity: 0,
         }
     }
 
@@ -63,16 +62,28 @@ impl Encoder {
 
     pub fn capacity_instruction(&self, out: &mut [u8]) -> Result<usize> {
         let mut b = octets::OctetsMut::with_slice(out);
-        encode_int(self.chosen_capacity, start::SET_CAPACITY, enc_prefix::SET_CAPACITY, &mut b)?;
+        encode_int(
+            self.chosen_capacity,
+            start::SET_CAPACITY,
+            enc_prefix::SET_CAPACITY,
+            &mut b,
+        )?;
         Ok(b.off())
     }
 
-    pub fn insert(&self, out: &mut [u8], hdr: &Header, idx: u64, with_name: bool) -> Result<usize> {
+    pub fn insert(
+        &self, out: &mut [u8], hdr: &Header, idx: u64, with_name: bool,
+    ) -> Result<usize> {
         let mut b = octets::OctetsMut::with_slice(out);
 
         if with_name {
             const STATIC: u8 = 0b0100_0000;
-            encode_int(idx, start::INSERT_WITH_NAME | STATIC, enc_prefix::NAME_INDEX, &mut b)?;
+            encode_int(
+                idx,
+                start::INSERT_WITH_NAME | STATIC,
+                enc_prefix::NAME_INDEX,
+                &mut b,
+            )?;
             encode_value_str(&hdr.1, &mut b)?;
             return Ok(b.off());
         }
@@ -101,7 +112,7 @@ impl Encoder {
 
                 trace!("HeaderAck value={}", stream_id);
 
-                Ok((b.off(), Event::HeaderAck{v:stream_id}))
+                Ok((b.off(), Event::HeaderAck { v: stream_id }))
             },
 
             Ok(DecInstruction::StreamCancellation) => {
@@ -109,18 +120,19 @@ impl Encoder {
 
                 trace!("StreamCancellation value={}", stream_id);
 
-                Ok((b.off(), Event::StreamCancellation{v:stream_id}))
+                Ok((b.off(), Event::StreamCancellation { v: stream_id }))
             },
 
             Ok(DecInstruction::InsertCountIncrement) => {
-                let incr = decode_int(&mut b, dec_prefix::INSERT_COUNT_INCREMENT)?;
+                let incr =
+                    decode_int(&mut b, dec_prefix::INSERT_COUNT_INCREMENT)?;
 
                 trace!("InsertCountIncrement value={}", incr);
 
-                Ok((b.off(), Event::InsertCountIncrement{v:incr}))
+                Ok((b.off(), Event::InsertCountIncrement { v: incr }))
             },
 
-            Err(e) => Err(e)
+            Err(e) => Err(e),
         }
     }
 
@@ -142,14 +154,24 @@ impl Encoder {
                     const STATIC: u8 = 0b0100_0000;
 
                     // Encode as statically indexed.
-                    encode_int(idx, start::INDEXED | STATIC, rep_prefix::FIELD_INDEX, &mut b)?;
+                    encode_int(
+                        idx,
+                        start::INDEXED | STATIC,
+                        rep_prefix::FIELD_INDEX,
+                        &mut b,
+                    )?;
                 },
 
                 Some((idx, false)) => {
                     const STATIC: u8 = 0b0001_0000;
 
                     // Encode value as literal with static name reference.
-                    encode_int(idx, start::LITERAL_WITH_NAME_REF | STATIC, rep_prefix::NAME_INDEX, &mut b)?;
+                    encode_int(
+                        idx,
+                        start::LITERAL_WITH_NAME_REF | STATIC,
+                        rep_prefix::NAME_INDEX,
+                        &mut b,
+                    )?;
                     encode_value_str(&h.1, &mut b)?;
                 },
 
@@ -316,17 +338,18 @@ fn lookup_static(h: &Header) -> Option<(u64, bool)> {
     Some(idx)
 }
 
-
-
 fn encode_name_str(v: &str, b: &mut octets::OctetsMut, first: u8) -> Result<()> {
     let len = super::huffman::encode_output_length(v.as_bytes())?;
 
     let (frst, prefix) = match first {
         start::LITERAL => (start::LITERAL | 0b0000_1000, rep_prefix::NAME_LENGTH),
 
-        start::INSERT_WITHOUT_NAME => (start::INSERT_WITHOUT_NAME | 0b0010_0000, enc_prefix::NAME_LENGTH),
+        start::INSERT_WITHOUT_NAME => (
+            start::INSERT_WITHOUT_NAME | 0b0010_0000,
+            enc_prefix::NAME_LENGTH,
+        ),
 
-        _ => unreachable!()
+        _ => unreachable!(),
     };
 
     encode_int(len as u64, frst, prefix, b)?;
@@ -344,7 +367,6 @@ fn encode_value_str(v: &str, b: &mut octets::OctetsMut) -> Result<()> {
     super::huffman::encode(v.as_bytes(), b)?;
 
     Ok(())
-
 }
 
 #[cfg(test)]
@@ -405,9 +427,14 @@ mod tests {
 
         assert_eq!(start::INSERT_WITHOUT_NAME | 0b0010_0000, 0b0110_0000);
 
-        assert!(encode_int(10, start::INSERT_WITHOUT_NAME | 0b0010_0000, 5, &mut b).is_ok());
+        assert!(encode_int(
+            10,
+            start::INSERT_WITHOUT_NAME | 0b0010_0000,
+            5,
+            &mut b
+        )
+        .is_ok());
 
         assert_eq!(expected, encoded);
     }
-
 }

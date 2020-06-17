@@ -430,9 +430,6 @@ impl Stream {
 
     // TODO LP
     pub fn try_consume_instruction(&mut self) -> Result<()> {
-
-
-
         Ok(())
     }
 
