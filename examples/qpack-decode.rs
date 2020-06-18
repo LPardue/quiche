@@ -34,8 +34,6 @@ use std::io::prelude::*;
 use quiche::h3::qpack;
 
 fn main() {
-    // TODO: parse params from file name.
-
     let mut args = std::env::args();
 
     let cmd = &args.next().unwrap();
@@ -45,9 +43,22 @@ fn main() {
         return;
     }
 
-    let mut file = File::open(&args.next().unwrap()).unwrap();
+    let path = &args.next().unwrap();
 
-    let mut dec = qpack::Decoder::new(256);
+    let params: Vec<&str> = path.split('.').rev().collect();
+    let max_dyn_table_capacity = u64::from_str_radix(params[2], 10).unwrap();
+    let max_blocked_streams = u64::from_str_radix(params[1], 10).unwrap();
+    let ack_mode = u64::from_str_radix(params[0], 10).unwrap();
+
+    let mut file = File::open(&path).unwrap();
+
+    debug!("Loaded {}, max_dynamic_table_capacity={} max_blocked_streams={} ack_mode={}",
+        &path,
+        max_dyn_table_capacity,
+        max_blocked_streams,
+        ack_mode);
+
+    let mut dec = qpack::Decoder::new(max_dyn_table_capacity);
 
     env_logger::builder()
         .default_format_timestamp_nanos(true)
@@ -74,12 +85,12 @@ fn main() {
         debug!("Got stream={} len={}", stream_id, len);
 
         if stream_id == 0 {
-            error!("read stream 0. len={}", len);
+            debug!("read stream 0. len={}", len);
             let mut off = 0;
             while off < len {
                 match dec.control(&mut data[off..len]) {
                     Ok((size, ev)) => {
-                        println!("Got {:?}, size={}", ev, size);
+                        debug!("Got {:?}, size={}", ev, size);
                         off += size;
                     },
 
@@ -96,10 +107,10 @@ fn main() {
             }
         } else {
             for hdr in dec.decode(&data[..len], std::u64::MAX).unwrap() {
-                // println!("{}\t{}", hdr.name(), hdr.value());
+                println!("{}\t{}", hdr.name(), hdr.value());
             }
-        }
 
-        // println!();
+            println!();
+        }
     }
 }
