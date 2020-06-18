@@ -75,7 +75,7 @@ impl Decoder {
 
     fn lookup_dynamic_relative_index(&self, index: u64) -> Result<&TableEntry> {
         if index as usize >= self.dynamic.len() {
-            trace!("Index out of bounds {}", index);
+            trace!("out of bounds error, table_size={}, index={}", self.dynamic.len(), index);
             return Err(Error::DecompressionFailed);
         }
 
@@ -90,6 +90,7 @@ impl Decoder {
             self.base - (base + index + 1)
         } else {
             if (self.base + index) < base {
+
                 return Err(Error::DecompressionFailed);
             }
             (self.base + index) - base
@@ -202,7 +203,7 @@ impl Decoder {
                 // TODO LP validate table has enough space first, don't
                 // clone the header to return an event
                 self.dynamic.push_front(TableEntry {
-                    base: 0,
+                    base: self.base,
                     hdr: hdr.clone(),
                     refs: 0,
                 });
@@ -222,7 +223,7 @@ impl Decoder {
 
                 // TODO LP validate table has enough space first
                 self.dynamic.push_front(TableEntry {
-                    base: 0,
+                    base: self.base,
                     hdr,
                     refs: 0,
                 });

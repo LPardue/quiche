@@ -84,10 +84,6 @@ enum EncInstruction {
 
 impl EncInstruction {
     pub fn from_byte(b: u8) -> Result<Self> {
-        if b == 0 {
-            return Err(Error::Done);
-        }
-
         // order of checks is important in order to avoid aliasing instruction
         // types
         if b & start::INSERT_WITH_NAME == start::INSERT_WITH_NAME {
@@ -384,10 +380,18 @@ mod tests {
         let mut dec = Decoder::new(256);
         let mut buf = [0u8; 24];
 
-        // duplicate (TODO we should really check it duplicated an entry or
-        // something)
+
+        let hdr = h3::Header::new(":method", "HELP");
+        assert_eq!(enc.insert(&mut buf, &hdr, 15, true), Ok(6));
+        assert_eq!(dec.control(&mut buf), Ok((6, Event::Header { v: hdr })));
+
+        assert_eq!(enc.duplicate(&mut buf, 0), Ok(1));
+        assert_eq!(dec.control(&mut buf), Ok((1, Event::Duplicate { v: 0 })));
+
+
+        // duplicating an entry that does not exist is an error
         assert_eq!(enc.duplicate(&mut buf, 5), Ok(1));
-        assert_eq!(dec.control(&mut buf), Ok((1, Event::Duplicate { v: 5 })));
+        assert_eq!(dec.control(&mut buf), Err(super::Error::DecompressionFailed));
     }
 
     #[test]
