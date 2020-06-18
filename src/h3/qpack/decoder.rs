@@ -47,7 +47,7 @@ pub struct Decoder {
     advertised_capacity: u64,
 
     // TODO LP
-    base: u64,
+    total_insert_count: u64,
 
     dynamic: VecDeque<TableEntry>,
 }
@@ -58,14 +58,15 @@ impl Decoder {
         Decoder {
             max_table_capacity,
             advertised_capacity: 0,
-            base: 0,
+            total_insert_count: 0,
             dynamic: VecDeque::new(),
         }
     }
 
-    fn lookup_dynamic_with_absolute_index(&mut self, index: u64) -> Result<&mut TableEntry> {
-
-        let index = self.base - index - 1;
+    fn lookup_dynamic_with_absolute_index(
+        &mut self, index: u64,
+    ) -> Result<&mut TableEntry> {
+        let index = self.total_insert_count - index - 1;
         if index as usize >= self.dynamic.len() {
             trace!("Index out of bounds {}", index);
             return Err(Error::DecompressionFailed);
@@ -75,26 +76,38 @@ impl Decoder {
 
     fn lookup_dynamic_relative_index(&self, index: u64) -> Result<&TableEntry> {
         if index as usize >= self.dynamic.len() {
-            trace!("out of bounds error, table_size={}, index={}", self.dynamic.len(), index);
+            trace!(
+                "out of bounds error, table_size={}, index={}",
+                self.dynamic.len(),
+                index
+            );
             return Err(Error::DecompressionFailed);
         }
 
         Ok(&self.dynamic[index as usize])
     }
 
-    pub fn lookup_dynamic(&self, index: u64, base: u64, post_base: bool) -> Result<&TableEntry> {
+    pub fn lookup_dynamic(
+        &self, index: u64, base: u64, post_base: bool,
+    ) -> Result<&TableEntry> {
         let index = if post_base {
-            if self.base < (base + index + 1) {
+            if self.total_insert_count < (base + index + 1) {
                 return Err(Error::DecompressionFailed);
             }
-            self.base - (base + index + 1)
+            self.total_insert_count - (base + index + 1)
         } else {
-            if (self.base + index) < base {
-
+            if (self.total_insert_count + index) < base {
                 return Err(Error::DecompressionFailed);
             }
-            (self.base + index) - base
+            (self.total_insert_count + index) - base
         };
+
+        trace!(
+            "base={}, total_insert_count={}, calculated_index={}",
+            base,
+            self.total_insert_count,
+            index
+        );
 
         self.lookup_dynamic_relative_index(index)
     }
@@ -162,11 +175,14 @@ impl Decoder {
                 let (name, _) = if s {
                     lookup_static(name_idx)?
                 } else {
-                    let name = self.lookup_dynamic(name_idx, self.base, false)?.hdr.name();
+                    let name = self
+                        .lookup_dynamic(name_idx, self.total_insert_count, false)?
+                        .hdr
+                        .name();
                     (name, "")
 
-                    //error!("dynamic name ref not support");
-                    //panic!("dammit");
+                    // error!("dynamic name ref not support");
+                    // panic!("dammit");
                 };
 
                 trace!(
@@ -187,7 +203,7 @@ impl Decoder {
                     refs: 0,
                 });
 
-                self.base += 1;
+                self.total_insert_count += 1;
 
                 Ok((b.off(), Event::Header { v: hdr }))
             },
@@ -203,12 +219,12 @@ impl Decoder {
                 // TODO LP validate table has enough space first, don't
                 // clone the header to return an event
                 self.dynamic.push_front(TableEntry {
-                    base: self.base,
+                    base: self.total_insert_count,
                     hdr: hdr.clone(),
                     refs: 0,
                 });
 
-                self.base += 1;
+                self.total_insert_count += 1;
 
                 Ok((b.off(), Event::Header { v: hdr }))
             },
@@ -219,16 +235,19 @@ impl Decoder {
                 trace!("Duplicate index={}", idx);
 
                 // clone to avoid double mutable reference
-                let hdr = self.lookup_dynamic(idx, self.base, false)?.hdr.clone();
+                let hdr = self
+                    .lookup_dynamic(idx, self.total_insert_count, false)?
+                    .hdr
+                    .clone();
 
                 // TODO LP validate table has enough space first
                 self.dynamic.push_front(TableEntry {
-                    base: self.base,
+                    base: self.total_insert_count,
                     hdr,
                     refs: 0,
                 });
 
-                self.base += 1;
+                self.total_insert_count += 1;
 
                 Ok((b.off(), Event::Duplicate { v: idx }))
             },
@@ -240,7 +259,7 @@ impl Decoder {
         // Err(Error::Done)
     }
 
-    fn decode_insert_count(&self, b: &mut octets::Octets) -> Result<u64> {
+    fn decode_req_insert_count(&self, b: &mut octets::Octets) -> Result<u64> {
         let encoded_insert_count =
             decode_int(b, rep_prefix::REQUIRED_INSERT_COUNT)?;
 
@@ -258,7 +277,7 @@ impl Decoder {
             return Err(Error::DecompressionFailed);
         }
 
-        let max_value = self.base + max_entries;
+        let max_value = self.total_insert_count + max_entries;
         let max_wrapped = (max_value / full_range) * full_range;
         let mut req_insert_count = max_wrapped + encoded_insert_count - 1;
 
@@ -307,7 +326,7 @@ impl Decoder {
         // let encoded_insert_count = decode_int(&mut b,
         // rep_prefix::REQUIRED_INSERT_COUNT)?;
 
-        let req_insert_count = self.decode_insert_count(&mut b)?;
+        let req_insert_count = self.decode_req_insert_count(&mut b)?;
         let base = Decoder::decode_base(&mut b, req_insert_count)?;
 
         trace!("Header req_insert_count={} base={}", req_insert_count, base);
@@ -329,14 +348,16 @@ impl Decoder {
                         Header::new(&name, &value)
                     } else {
                         // TODO LP: implement dynamic table
-                        let hdr =
-                            self.lookup_dynamic(index, self.base, false)?.hdr.clone();
-                        hdr
-                        //return Err(Error::InvalidHeaderValue);
+
+                        self.lookup_dynamic(index, base, false)?.hdr.clone()
+
+                        // return Err(Error::InvalidHeaderValue);
                     };
 
                     left = left
-                        .checked_sub((hdr.name().len() + hdr.value().len()) as u64)
+                        .checked_sub(
+                            (hdr.name().len() + hdr.value().len()) as u64,
+                        )
                         .ok_or(Error::HeaderListTooLarge)?;
 
                     out.push(hdr);
@@ -349,10 +370,9 @@ impl Decoder {
                     trace!("Indexed With Post Base index={}", index);
 
                     // TODO LP: implement dynamic table
-                    //return Err(Error::InvalidHeaderValue);
-                    let hdr = self.lookup_dynamic(index, self.base, true)?.hdr.clone();
+                    // return Err(Error::InvalidHeaderValue);
+                    let hdr = self.lookup_dynamic(index, base, true)?.hdr.clone();
                     out.push(hdr);
-
                 },
 
                 Representation::Literal => {
@@ -390,11 +410,14 @@ impl Decoder {
                     let (name, _) = if s {
                         lookup_static(name_idx)?
                     } else {
-                        let name = self.lookup_dynamic(name_idx, self.base, false)?.hdr.name();
+                        let name = self
+                            .lookup_dynamic(name_idx, base, false)?
+                            .hdr
+                            .name();
                         (name, "")
 
-                        //error!("dynamic name ref not support");
-                        //panic!("dammit");
+                        // error!("dynamic name ref not support");
+                        // panic!("dammit");
                     };
 
                     left = left
@@ -413,7 +436,6 @@ impl Decoder {
                         name_idx,
                         value
                     );
-
 
                     // TODO: implement dynamic table
                     return Err(Error::InvalidHeaderValue);
@@ -625,11 +647,11 @@ mod tests {
         // test case taken from QPACK, see
         // https://tools.ietf.org/html/draft-ietf-quic-qpack-16#section-4.5.1.1
         let mut decoder = Decoder::new(100);
-        decoder.base = 10;
+        decoder.total_insert_count = 10;
 
         let mut encoded = [0b00100];
         let mut b = octets::Octets::with_slice(&mut encoded);
-        assert_eq!(decoder.decode_insert_count(&mut b).unwrap(), 9);
+        assert_eq!(decoder.decode_req_insert_count(&mut b).unwrap(), 9);
     }
 
     #[test]

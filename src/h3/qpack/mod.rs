@@ -380,7 +380,6 @@ mod tests {
         let mut dec = Decoder::new(256);
         let mut buf = [0u8; 24];
 
-
         let hdr = h3::Header::new(":method", "HELP");
         assert_eq!(enc.insert(&mut buf, &hdr, 15, true), Ok(6));
         assert_eq!(dec.control(&mut buf), Ok((6, Event::Header { v: hdr })));
@@ -388,10 +387,12 @@ mod tests {
         assert_eq!(enc.duplicate(&mut buf, 0), Ok(1));
         assert_eq!(dec.control(&mut buf), Ok((1, Event::Duplicate { v: 0 })));
 
-
         // duplicating an entry that does not exist is an error
         assert_eq!(enc.duplicate(&mut buf, 5), Ok(1));
-        assert_eq!(dec.control(&mut buf), Err(super::Error::DecompressionFailed));
+        assert_eq!(
+            dec.control(&mut buf),
+            Err(super::Error::DecompressionFailed)
+        );
     }
 
     #[test]
@@ -400,7 +401,8 @@ mod tests {
         let mut dec = Decoder::new(256);
 
         // combine several instructions into this single buffer
-        let mut buf = [0u8; 24];
+        const TOTAL_INSTRUCTION_SIZE: usize = 23;
+        let mut buf = [0u8; TOTAL_INSTRUCTION_SIZE];
 
         let mut off = 0;
 
@@ -412,7 +414,7 @@ mod tests {
         let hdr = h3::Header::new(":path", "thewrongpath");
         off += enc.insert(&mut buf[off..], &hdr, 1, false).unwrap();
 
-        off += enc.duplicate(&mut buf[off..], 5).unwrap();
+        off += enc.duplicate(&mut buf[off..], 0).unwrap();
 
         off = 0;
         let (size, _) = dec.control(&mut buf[off..]).unwrap();
@@ -427,7 +429,7 @@ mod tests {
         let (size, _) = dec.control(&mut buf[off..]).unwrap();
 
         off += size;
-        assert_eq!(dec.control(&mut buf[off..]), Err(h3::qpack::Error::Done));
+        assert_eq!(off, TOTAL_INSTRUCTION_SIZE);
     }
 
     #[test]
