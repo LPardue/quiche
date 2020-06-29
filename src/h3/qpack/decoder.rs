@@ -90,6 +90,13 @@ impl Decoder {
     pub fn lookup_dynamic(
         &self, index: u64, base: u64, post_base: bool,
     ) -> Result<&TableEntry> {
+        trace!(
+            "base={}, total_insert_count={}, provided_index={}",
+            base,
+            self.total_insert_count,
+            index
+        );
+
         let index = if post_base {
             if self.total_insert_count < (base + index + 1) {
                 return Err(Error::DecompressionFailed);
@@ -259,9 +266,95 @@ impl Decoder {
         // Err(Error::Done)
     }
 
+    pub fn total_insert_count(&self) -> u64 {
+        self.total_insert_count
+    }
+
+    pub fn decode_req_insert_count3(
+        &self, encoded_insert_count: u64,
+    ) -> Result<u64> {
+        if encoded_insert_count == 0 {
+            return Ok(0);
+        }
+
+        let max_entries = self.max_table_capacity / 32;
+        let full_range = 2 * max_entries;
+
+        trace!("self.max_cap={} max_entries={} encoded_insert_count={} full_range={}", self.max_table_capacity, max_entries, encoded_insert_count, full_range);
+
+        if encoded_insert_count > full_range {
+            trace!("fudge 1");
+            return Err(Error::DecompressionFailed);
+        }
+
+        let max_value = self.total_insert_count + max_entries;
+        let max_wrapped = (max_value / full_range) * full_range;
+        let mut req_insert_count = max_wrapped + encoded_insert_count - 1;
+
+        if req_insert_count > max_value {
+            if req_insert_count <= full_range {
+                trace!("fudge 2");
+                return Err(Error::DecompressionFailed);
+            }
+            req_insert_count -= full_range;
+        }
+
+        if req_insert_count == 0 {
+            trace!("fudge 3");
+            return Err(Error::DecompressionFailed);
+        }
+
+        Ok(req_insert_count)
+    }
+
+    // returns the (length, val) where length is the number of bytes needed to
+    // consume the value TODO LP this is the GOOD one!!!!!!
+    pub fn decode_req_insert_count2(&self, buf: &[u8]) -> Result<(usize, u64)> {
+        // error!("size before={}", 0);
+        let (size, encoded_insert_count) =
+            decode_int2(buf, rep_prefix::REQUIRED_INSERT_COUNT)?;
+
+        // error!("size after={}", size);
+
+        if encoded_insert_count == 0 {
+            return Ok((size, 0));
+        }
+
+        let max_entries = self.max_table_capacity / 32;
+        let full_range = 2 * max_entries;
+
+        trace!("self.max_cap={} max_entries={} encoded_insert_count={} full_range={}", self.max_table_capacity, max_entries, encoded_insert_count, full_range);
+
+        if encoded_insert_count > full_range {
+            trace!("fudge 1");
+            return Err(Error::DecompressionFailed);
+        }
+
+        let max_value = self.total_insert_count + max_entries;
+        let max_wrapped = (max_value / full_range) * full_range;
+        let mut req_insert_count = max_wrapped + encoded_insert_count - 1;
+
+        if req_insert_count > max_value {
+            if req_insert_count <= full_range {
+                trace!("fudge 2");
+                return Err(Error::DecompressionFailed);
+            }
+            req_insert_count -= full_range;
+        }
+
+        if req_insert_count == 0 {
+            trace!("fudge 3");
+            return Err(Error::DecompressionFailed);
+        }
+
+        Ok((size, req_insert_count))
+    }
+
     fn decode_req_insert_count(&self, b: &mut octets::Octets) -> Result<u64> {
+        // error!("b.off() before={}", b.off());
         let encoded_insert_count =
             decode_int(b, rep_prefix::REQUIRED_INSERT_COUNT)?;
+        // error!("b.off() after={}", b.off());
 
         if encoded_insert_count == 0 {
             return Ok(0);
@@ -297,6 +390,23 @@ impl Decoder {
         Ok(req_insert_count)
     }
 
+    fn decode_base2(
+        buf: &[u8], required_insert_count: u64,
+    ) -> Result<(usize, u64)> {
+        let first = buf.first().ok_or(Error::BufferTooShort)?;
+        let s = first & 0b1000_0000 == 0b1000_0000;
+
+        let (size, delta_base) = decode_int2(buf, rep_prefix::BASE)?;
+
+        let value = if s {
+            required_insert_count - delta_base - 1
+        } else {
+            required_insert_count + delta_base
+        };
+
+        Ok((size, value))
+    }
+
     fn decode_base(
         b: &mut octets::Octets, required_insert_count: u64,
     ) -> Result<u64> {
@@ -315,27 +425,59 @@ impl Decoder {
     }
 
     /// Decodes a QPACK header block into a list of headers.
-    pub fn decode(&mut self, buf: &[u8], max_size: u64) -> Result<Vec<Header>> {
+    pub fn decode(
+        &mut self, buf: &[u8], req_insert_count: u64, max_size: u64,
+    ) -> Result<Vec<Header>> {
         trace!("decoding encoded field section");
-        let mut b = octets::Octets::with_slice(buf);
 
         let mut out = Vec::new();
 
         let mut left = max_size;
 
-        // let encoded_insert_count = decode_int(&mut b,
-        // rep_prefix::REQUIRED_INSERT_COUNT)?;
+        let mut offset = 0;
 
-        let req_insert_count = self.decode_req_insert_count(&mut b)?;
+        let mut b = octets::Octets::with_slice(buf);
+
+        // let (size,req_insert_count2) = self.decode_req_insert_count2(buf)?;
+        // offset+=size;
+        // let mut b = octets::Octets::with_slice(&buf[offset..]);
+        // let req_insert_count = self.decode_req_insert_count(&mut b)?;
+
+        // if req_insert_count != req_insert_count2 {
+        //    error!("WTF RIC req_insert_count={}, req_insert_count2={}",
+        // req_insert_count, req_insert_count2);
+        //}
+
+        // assert_eq!(req_insert_count, req_insert_count2);
+
         let base = Decoder::decode_base(&mut b, req_insert_count)?;
 
-        trace!("Header req_insert_count={} base={}", req_insert_count, base);
+        // TODO: don't consume bytes until we know we're not blocked
+        // let (size,req_insert_count) =
+        // self.decode_req_insert_count2(&buf[offset..])?; offset+=size;
+
+        // let (size, base) = Decoder::decode_base2(&buf[offset..],
+        // req_insert_count)?; offset+=size;
+
+        error!(
+            "Header req_insert_count={} base={} total_insert_count={}",
+            req_insert_count, base, self.total_insert_count
+        );
+
+        if req_insert_count > self.total_insert_count {
+            trace!("oh shit");
+            return Err(Error::Blocked);
+        }
+
+        // let mut b = octets::Octets::with_slice(&buf[offset..]);
 
         while b.cap() > 0 {
+            trace!("cap={}", b.cap());
             let first = b.peek_u8()?;
 
             match Representation::from_byte(first) {
                 Representation::Indexed => {
+                    trace!("Indexed");
                     const STATIC: u8 = 0b0100_0000;
 
                     let s = first & STATIC == STATIC;
@@ -364,18 +506,37 @@ impl Decoder {
                 },
 
                 Representation::IndexedWithPostBase => {
-                    let index =
-                        decode_int(&mut b, rep_prefix::NAME_INDEX_POST_BASE)?;
+                    trace!("IndexedWithPostBase");
+                    let index = decode_int(
+                        &mut b,
+                        rep_prefix::INDEXED_WITH_POST_BASE_NAME_INDEX,
+                    )?;
 
-                    trace!("Indexed With Post Base index={}", index);
+                    trace!("Indexed With Post Base name_idx={}", index);
 
                     // TODO LP: implement dynamic table
                     // return Err(Error::InvalidHeaderValue);
                     let hdr = self.lookup_dynamic(index, base, true)?.hdr.clone();
+
+                    trace!(
+                        "Indexed With Post Base name_idx={} name={} value={}",
+                        index,
+                        hdr.name(),
+                        hdr.value()
+                    );
+
+                    left = left
+                        .checked_sub(
+                            (hdr.name().len() + hdr.value().len()) as u64,
+                        )
+                        .ok_or(Error::HeaderListTooLarge)?;
+
+                    trace! {"ok okok"}
                     out.push(hdr);
                 },
 
                 Representation::Literal => {
+                    trace!("Literal");
                     let name = decode_name_str(&mut b, rep_prefix::NAME_LENGTH)?;
 
                     let value = decode_value_str(&mut b)?;
@@ -394,6 +555,7 @@ impl Decoder {
                 },
 
                 Representation::LiteralWithNameRef => {
+                    trace!("LiteralWithNameRef");
                     const STATIC: u8 = 0b0001_0000;
 
                     let s = first & STATIC == STATIC;
@@ -428,7 +590,11 @@ impl Decoder {
                 },
 
                 Representation::LiteralWithPostBase => {
-                    let name_idx = decode_int(&mut b, rep_prefix::NAME_INDEX)?;
+                    trace!("LiteralWithPostBase");
+                    let name_idx = decode_int(
+                        &mut b,
+                        rep_prefix::LITERAL_WITH_POST_BASE_NAME_INDEX,
+                    )?;
                     let value = decode_value_str(&mut b)?;
 
                     trace!(
@@ -437,8 +603,15 @@ impl Decoder {
                         value
                     );
 
+                    let name =
+                        self.lookup_dynamic(name_idx, base, true)?.hdr.name();
+
+                    left = left
+                        .checked_sub((name.len() + value.len()) as u64)
+                        .ok_or(Error::HeaderListTooLarge)?;
+
                     // TODO: implement dynamic table
-                    return Err(Error::InvalidHeaderValue);
+                    out.push(Header::new(name, &value));
                 },
             }
         }

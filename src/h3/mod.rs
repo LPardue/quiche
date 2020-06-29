@@ -1350,6 +1350,38 @@ impl Connection {
                     };
                 },
 
+                stream::State::HeadersRic => {
+                    stream.try_fill_buffer(conn)?;
+                    match stream.try_consume_ric(&self.qpack_decoder) {
+                        Ok(decoded_ric) => {
+                            if decoded_ric >
+                                self.qpack_decoder.total_insert_count()
+                            {
+                                trace!("bloody blocked mate");
+                                stream.headers_blocked();
+                            }
+                        },
+
+                        Err(Error::BufferTooShort) => continue,
+
+                        Err(e) => {
+                            conn.close(
+                                true,
+                                e.to_wire(),
+                                b"QpackDecompressionFailed",
+                            )?;
+
+                            return Err(e);
+                        },
+                    }
+                },
+
+                stream::State::HeadersBlocked => {
+                    // Not much we can do in this state!
+                    // Hope that processing the decoder instructions will get
+                    // out out of this whole
+                },
+
                 stream::State::Data => {
                     return Ok((stream_id, Event::Data));
                 },
@@ -1418,9 +1450,12 @@ impl Connection {
                     .max_header_list_size
                     .unwrap_or(std::u64::MAX);
 
+                let ric =
+                    self.streams.get(&stream_id).unwrap().hdr_ric().unwrap();
+
                 let headers = self
                     .qpack_decoder
-                    .decode(&header_block[..], max_size)
+                    .decode(&header_block[..], ric, max_size)
                     .map_err(|e| match e {
                         qpack::Error::HeaderListTooLarge => Error::ExcessiveLoad,
 

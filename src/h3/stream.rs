@@ -65,6 +65,12 @@ pub enum State {
     /// Reading DATA payload.
     Data,
 
+    /// Reading HEADERS ric.
+    HeadersRic,
+
+    /// Reading HEADERS payload is blocked.
+    HeadersBlocked,
+
     /// Reading the push ID.
     PushId,
 
@@ -135,6 +141,10 @@ pub struct Stream {
 
     /// Whether the stream has been locally initialized.
     local_initialized: bool,
+
+    /// stuff for headers
+    hdr_block_len: Option<usize>,
+    hdr_ric: Option<u64>,
 }
 
 impl Stream {
@@ -171,11 +181,18 @@ impl Stream {
             is_local,
             remote_initialized: false,
             local_initialized: false,
+
+            hdr_block_len: None,
+            hdr_ric: None,
         }
     }
 
     pub fn state(&self) -> State {
         self.state
+    }
+
+    pub fn hdr_ric(&self) -> Option<u64> {
+        self.hdr_ric
     }
 
     /// Sets the stream's type and transitions to the next state.
@@ -323,13 +340,23 @@ impl Stream {
             self.ty == Some(Type::Request) ||
             self.ty == Some(Type::Push)
         {
-            let (state, resize) = match self.frame_type {
-                Some(frame::DATA_FRAME_TYPE_ID) => (State::Data, false),
+            let (state, resize, len) = match self.frame_type {
+                Some(frame::DATA_FRAME_TYPE_ID) =>
+                    (State::Data, false, len as usize),
 
-                _ => (State::FramePayload, true),
+                // maybe resize needs more understanding?
+                Some(frame::HEADERS_FRAME_TYPE_ID) => {
+                    // store the actual length of the real headers block so we can
+                    // use it later
+                    self.hdr_block_len = Some(len as usize);
+                    // the minimal length of the RIC is 1 byte, so start there
+                    (State::HeadersRic, true, 1)
+                },
+
+                _ => (State::FramePayload, true, len as usize),
             };
 
-            self.state_transition(state, len as usize, resize)?;
+            self.state_transition(state, len, resize)?;
 
             return Ok(());
         }
@@ -426,6 +453,40 @@ impl Stream {
         self.state_transition(State::FrameType, 1, true)?;
 
         Ok(frame)
+    }
+
+    // TODO LP
+    pub fn try_consume_ric(
+        &mut self, decoder: &crate::h3::qpack::Decoder,
+    ) -> Result<u64> {
+        let (size, decoded_insert_count) =
+            match decoder.decode_req_insert_count2(&self.state_buf) {
+                Ok(v) => v,
+
+                Err(crate::h3::qpack::Error::BufferTooShort) => {
+                    return Err(Error::BufferTooShort);
+                },
+
+                Err(_) => {
+                    return Err(Error::QpackDecompressionFailed);
+                },
+            };
+
+        let remaining_hdr_bytes = self.hdr_block_len.unwrap() - size;
+
+        self.state_transition(State::FramePayload, remaining_hdr_bytes, true)?;
+
+        self.hdr_ric = Some(decoded_insert_count);
+
+        Ok(decoded_insert_count)
+    }
+
+    pub fn headers_blocked(&mut self) {
+        self.state = State::HeadersBlocked;
+    }
+
+    pub fn headers_unblocked(&mut self) {
+        self.state = State::FramePayload;
     }
 
     // TODO LP
@@ -732,11 +793,15 @@ mod tests {
     #[test]
     fn request_good() {
         let mut stream = Stream::new(0, false);
+        let decoder = crate::h3::qpack::Decoder::new(0);
 
         let mut d = vec![42; 128];
         let mut b = octets::OctetsMut::with_slice(&mut d);
 
-        let header_block = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        // The header block data is mostly unimportant but it must start with 0 to
+        // indicate a Required Insert Count of 0, emulating no dynamic
+        // compression.
+        let header_block = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let payload = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let hdrs = frame::Frame::Headers { header_block };
         let data = frame::Frame::Data {
@@ -761,14 +826,20 @@ mod tests {
         stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
 
         let frame_payload_len = stream.try_consume_varint().unwrap();
-        assert_eq!(frame_payload_len, 12);
+        assert_eq!(frame_payload_len, 13);
 
         stream.set_frame_payload_len(frame_payload_len).unwrap();
-        assert_eq!(stream.state, State::FramePayload);
+        assert_eq!(stream.state, State::HeadersRic);
 
-        // Parse the HEADERS frame.
+        // Parse the HEADERS frame in two stages
         stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
 
+        assert_eq!(stream.try_consume_ric(&decoder), Ok(0));
+        assert_eq!(stream.state, State::FramePayload);
+
+        let header_block = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let hdrs = frame::Frame::Headers { header_block };
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
         assert_eq!(stream.try_consume_frame(), Ok(hdrs));
         assert_eq!(stream.state, State::FrameType);
 
@@ -804,11 +875,15 @@ mod tests {
     #[test]
     fn push_good() {
         let mut stream = Stream::new(2, false);
+        let decoder = crate::h3::qpack::Decoder::new(0);
 
         let mut d = vec![42; 128];
         let mut b = octets::OctetsMut::with_slice(&mut d);
 
-        let header_block = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        // The header block data is mostly unimportant but it must start with 0 to
+        // indicate a Required Insert Count of 0, emulating no dynamic
+        // compression.
+        let header_block = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let payload = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let hdrs = frame::Frame::Headers { header_block };
         let data = frame::Frame::Data {
@@ -854,14 +929,20 @@ mod tests {
         stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
 
         let frame_payload_len = stream.try_consume_varint().unwrap();
-        assert_eq!(frame_payload_len, 12);
+        assert_eq!(frame_payload_len, 13);
 
         stream.set_frame_payload_len(frame_payload_len).unwrap();
-        assert_eq!(stream.state, State::FramePayload);
+        assert_eq!(stream.state, State::HeadersRic);
 
-        // Parse the HEADERS frame.
+        // Parse the HEADERS frame in two stages
         stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
 
+        assert_eq!(stream.try_consume_ric(&decoder), Ok(0));
+        assert_eq!(stream.state, State::FramePayload);
+
+        let header_block = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let hdrs = frame::Frame::Headers { header_block };
+        stream.try_fill_buffer_for_tests(&mut cursor).unwrap();
         assert_eq!(stream.try_consume_frame(), Ok(hdrs));
         assert_eq!(stream.state, State::FrameType);
 

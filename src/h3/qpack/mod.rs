@@ -63,13 +63,14 @@ mod dec_prefix {
     pub const INSERT_COUNT_INCREMENT: usize = 6;
 }
 
-mod rep_prefix {
+pub mod rep_prefix {
     pub const REQUIRED_INSERT_COUNT: usize = 8;
     pub const BASE: usize = 7;
     pub const FIELD_INDEX: usize = 6; // Field line index
     pub const FIELD_INDEX_POST_BASE: usize = 4; // Field line index
     pub const NAME_INDEX: usize = 4;
-    pub const NAME_INDEX_POST_BASE: usize = 3;
+    pub const INDEXED_WITH_POST_BASE_NAME_INDEX: usize = 4;
+    pub const LITERAL_WITH_POST_BASE_NAME_INDEX: usize = 3;
     pub const NAME_LENGTH: usize = 3;
     pub const VALUE_LENGTH: usize = 7;
 }
@@ -222,6 +223,9 @@ pub enum Error {
 
     /// Decompression failed.
     DecompressionFailed,
+
+    // Decoding was blocked.
+    Blocked,
 }
 
 impl std::fmt::Display for Error {
@@ -271,10 +275,49 @@ fn encode_int(
     Ok(())
 }
 
+pub fn decode_int2(buf: &[u8], prefix: usize) -> Result<(usize, u64)> {
+    let mask = 2u64.pow(prefix as u32) - 1;
+
+    let mut offset = 0;
+
+    let mut val =
+        u64::from(*buf.get(offset).ok_or(Error::BufferTooShort)?);
+    // error!("decode_int2 val={}", val);
+    val &= mask;
+
+    offset += 1;
+
+    if val < mask {
+        return Ok((offset, val));
+    }
+
+    let mut shift = 0;
+
+    while let Some(byte) = buf.get(offset) {
+        // error!("decode_int2 loop");
+        offset += 1;
+
+        let inc = u64::from(byte & 0b0111_1111)
+            .checked_shl(shift)
+            .ok_or(Error::BufferTooShort)?;
+
+        val = val.checked_add(inc).ok_or(Error::BufferTooShort)?;
+
+        shift += 7;
+
+        if byte & 0b1000_0000 == 0 {
+            return Ok((offset, val));
+        }
+    }
+
+    Err(Error::BufferTooShort)
+}
+
 fn decode_int(b: &mut octets::Octets, prefix: usize) -> Result<u64> {
     let mask = 2u64.pow(prefix as u32) - 1;
 
     let mut val = u64::from(b.get_u8()?);
+    // error!("decode_int val={}", val);
     val &= mask;
 
     if val < mask {
@@ -284,6 +327,7 @@ fn decode_int(b: &mut octets::Octets, prefix: usize) -> Result<u64> {
     let mut shift = 0;
 
     while b.cap() > 0 {
+        // error!("decode_int loop");
         let byte = b.get_u8()?;
 
         let inc = u64::from(byte & 0b0111_1111)
@@ -328,7 +372,12 @@ mod tests {
         assert!(enc.encode(&headers, &mut encoded).is_ok());
 
         let mut dec = Decoder::new(256);
-        assert_eq!(dec.decode(&mut encoded, std::u64::MAX), Ok(headers));
+        let (size, decoded_insert_count) =
+            dec.decode_req_insert_count2(&encoded).unwrap();
+        assert_eq!(
+            dec.decode(&mut encoded[size..], decoded_insert_count, std::u64::MAX),
+            Ok(headers)
+        );
     }
 
     #[test]

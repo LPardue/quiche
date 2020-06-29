@@ -52,6 +52,9 @@ fn main() {
 
     let mut file = File::open(&path).unwrap();
 
+    let mut blocked_streams: std::collections::HashMap<u64, (u64, Vec<u8>)> =
+        std::collections::HashMap::new();
+
     debug!("Loaded {}, max_dynamic_table_capacity={} max_blocked_streams={} ack_mode={}",
         &path,
         max_dyn_table_capacity,
@@ -82,7 +85,7 @@ fn main() {
             break;
         }
 
-        debug!("Got stream={} len={}", stream_id, len);
+        error!("Got stream={} len={}", stream_id, len);
 
         if stream_id == 0 {
             debug!("read stream 0. len={}", len);
@@ -106,11 +109,54 @@ fn main() {
                 }
             }
         } else {
-            for hdr in dec.decode(&data[..len], std::u64::MAX).unwrap() {
-                println!("{}\t{}", hdr.name(), hdr.value());
+            let (size, decoded_insert_count) =
+                dec.decode_req_insert_count2(&data[..len]).unwrap();
+
+            if decoded_insert_count > dec.total_insert_count() {
+                error!(
+                    "ohshitshitsthit decoded_ric={} total_inserts={}",
+                    decoded_insert_count,
+                    dec.total_insert_count()
+                );
+                // panic!("byeee");
+                blocked_streams.insert(
+                    stream_id,
+                    (decoded_insert_count, data[size..len].to_vec()),
+                );
+                continue;
+            }
+
+            match dec.decode(
+                &data[size..len],
+                decoded_insert_count,
+                std::u64::MAX,
+            ) {
+                Ok(hdrs) =>
+                    for hdr in hdrs {
+                        println!("{}\t{}", hdr.name(), hdr.value());
+                    },
+
+                Err(qpack::Error::BufferTooShort) => continue,
+
+                Err(e) => panic!(e.to_string()),
             }
 
             println!();
         }
+    }
+
+    for (k, v) in blocked_streams {
+        match dec.decode(&v.1, v.0, std::u64::MAX) {
+            Ok(hdrs) =>
+                for hdr in hdrs {
+                    println!("{}\t{}", hdr.name(), hdr.value());
+                },
+
+            Err(qpack::Error::BufferTooShort) => continue,
+
+            Err(e) => panic!(e.to_string()),
+        }
+
+        println!();
     }
 }
