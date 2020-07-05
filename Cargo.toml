@@ -46,6 +46,12 @@ fuzzing = []
 # For building with Android NDK < 18 and GCC.
 ndk-old-gcc = []
 
+# Support for QUIC datagram extension
+quic-dgram = []
+
+# Support for HTTP/3 datagram extension
+h3-dgram = []
+
 [package.metadata.docs.rs]
 default-features = false
 

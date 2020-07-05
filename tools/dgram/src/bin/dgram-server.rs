@@ -38,8 +38,8 @@ const MAX_DATAGRAM_SIZE: usize = 1350;
 const SIDUCK_ALPN: &[u8] = b"\x06siduck";
 
 const USAGE: &str = "Usage:
-  http3-server [options]
-  http3-server -h | --help
+  dgram-server [options]
+  dgram-server -h | --help
 
 Options:
   --listen <addr>             Listen on the given IP:port [default: 127.0.0.1:4433]
@@ -128,7 +128,7 @@ fn main() {
     config.set_application_protos(alpn_proto).unwrap();
 
     config.set_max_idle_timeout(5000);
-    config.set_max_packet_size(MAX_DATAGRAM_SIZE as u64);
+    config.set_max_udp_payload_size(MAX_DATAGRAM_SIZE as u64);
     config.set_initial_max_data(max_data);
     config.set_initial_max_stream_data_bidi_local(max_stream_data);
     config.set_initial_max_stream_data_bidi_remote(max_stream_data);

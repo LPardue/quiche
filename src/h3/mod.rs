@@ -804,6 +804,7 @@ impl Connection {
 
     /// Sends an HTTP/3 Datagram with the specified flow ID, as defined in
     /// https://tools.ietf.org/html/draft-schinazi-quic-h3-datagram-02
+    #[cfg(feature = "h3-dgram")]
     pub fn dgram_send(
         &mut self, conn: &mut super::Connection, flow_id: u64, buf: &[u8],
     ) -> Result<()> {
@@ -823,6 +824,7 @@ impl Connection {
     /// given the maximum size supported by the peer, the current maximum
     /// packet length and the space required by the HTTP/3 and QUIC overheads.
     /// https://tools.ietf.org/html/draft-schinazi-quic-h3-datagram-02
+    #[cfg(feature = "h3-dgram")]
     pub fn dgram_max_writable_len(
         &self, conn: &super::Connection, flow_id: u64,
     ) -> Option<usize> {
@@ -929,6 +931,7 @@ impl Connection {
     }
 
     /// todo
+    #[cfg(feature = "h3-dgram")]
     pub fn poll_dgram(
         &mut self, conn: &mut super::Connection, buf: &mut [u8],
     ) -> Result<(u64, DatagramEvent)> {
@@ -1351,6 +1354,7 @@ impl Connection {
     }
 
     /// Process Datagrams
+    #[cfg(feature = "h3-dgram")]
     pub fn process_dgram(
         &mut self, conn: &mut super::Connection, buf: &mut [u8],
     ) -> Result<(u64, DatagramEvent)> {

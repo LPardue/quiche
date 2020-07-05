@@ -755,6 +755,7 @@ pub extern fn quiche_conn_stats(conn: &Connection, out: &mut Stats) {
 }
 
 #[no_mangle]
+#[cfg(feature = "quic-dgram")]
 pub extern fn quiche_conn_dgram_max_writable_len(conn: &Connection) -> ssize_t {
     match conn.dgram_max_writable_len() {
         None => Error::Done.to_c(),
@@ -764,6 +765,7 @@ pub extern fn quiche_conn_dgram_max_writable_len(conn: &Connection) -> ssize_t {
 }
 
 #[no_mangle]
+#[cfg(feature = "quic-dgram")]
 pub extern fn quiche_conn_dgram_send(
     conn: &mut Connection, buf: *const u8, buf_len: size_t,
 ) -> ssize_t {
@@ -781,6 +783,7 @@ pub extern fn quiche_conn_dgram_send(
 }
 
 #[no_mangle]
+#[cfg(feature = "quic-dgram")]
 pub extern fn quiche_conn_dgram_recv(
     conn: &mut Connection, out: *mut u8, out_len: size_t,
 ) -> ssize_t {
@@ -801,6 +804,7 @@ pub extern fn quiche_conn_dgram_recv(
 }
 
 #[no_mangle]
+#[cfg(feature = "quic-dgram")]
 pub extern fn quiche_conn_dgram_purge_outgoing(
     conn: &mut Connection,
     f: fn(*const u8, size_t) -> bool,

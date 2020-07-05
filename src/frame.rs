@@ -35,6 +35,8 @@ use crate::stream;
 pub const MAX_CRYPTO_OVERHEAD: usize = 8;
 pub const MAX_STREAM_OVERHEAD: usize = 12;
 pub const MAX_STREAM_SIZE: u64 = 1 << 62;
+
+#[cfg(feature = "quic-dgram")]
 pub const MAX_DGRAM_OVERHEAD: usize = 8;
 
 #[derive(Clone, PartialEq)]
@@ -140,6 +142,7 @@ pub enum Frame {
 
     HandshakeDone,
 
+    #[cfg(feature = "quic-dgram")]
     Datagram {
         data: Vec<u8>,
     },
@@ -261,6 +264,7 @@ impl Frame {
 
             0x1e => Frame::HandshakeDone,
 
+            #[cfg(feature = "quic-dgram")]
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
 
             _ => return Err(Error::InvalidFrame),
@@ -511,6 +515,7 @@ impl Frame {
                 b.put_varint(0x1e)?;
             },
 
+            #[cfg(feature = "quic-dgram")]
             Frame::Datagram { data } => {
                 let mut ty: u8 = 0x30;
 
@@ -696,6 +701,7 @@ impl Frame {
                 1 // frame type
             },
 
+            #[cfg(feature = "quic-dgram")]
             Frame::Datagram { data } => {
                 1 + // frame type
                 octets::varint_len(data.len() as u64) + // length
@@ -717,7 +723,9 @@ impl Frame {
 
     pub fn retransmittable(&self) -> bool {
         match self {
+            #[cfg(feature = "quic-dgram")]
             Frame::Datagram { .. } => false,
+
             _ => true,
         }
     }
@@ -868,6 +876,7 @@ impl Frame {
 
             Frame::HandshakeDone => qlog::QuicFrame::handshake_done(),
 
+            #[cfg(feature = "quic-dgram")]
             Frame::Datagram { .. } => qlog::QuicFrame::unknown(0x30),
         }
     }
@@ -1006,6 +1015,7 @@ impl std::fmt::Debug for Frame {
                 write!(f, "HANDSHAKE_DONE")?;
             },
 
+            #[cfg(feature = "quic-dgram")]
             Frame::Datagram { data } => {
                 write!(f, "DATAGRAM len={}", data.len(),)?;
             },
@@ -1084,6 +1094,7 @@ fn parse_stream_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
     Ok(Frame::Stream { stream_id, data })
 }
 
+#[cfg(feature = "quic-dgram")]
 fn parse_datagram_frame(ty: u64, b: &mut octets::Octets) -> Result<Frame> {
     let first = ty as u8;
 

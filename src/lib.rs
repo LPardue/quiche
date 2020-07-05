@@ -922,7 +922,9 @@ pub struct Connection {
     qlogged_peer_params: bool,
 
     /// Datagram queues.
+    #[cfg(feature = "quic-dgram")]
     dgram_recv_queue: dgram::DatagramQueue,
+    #[cfg(feature = "quic-dgram")]
     dgram_send_queue: dgram::DatagramQueue,
 }
 
@@ -1228,9 +1230,11 @@ impl Connection {
             #[cfg(feature = "qlog")]
             qlogged_peer_params: false,
 
+            #[cfg(feature = "quic-dgram")]
             dgram_recv_queue: dgram::DatagramQueue::new(
                 config.dgram_recv_max_queue_len),
 
+            #[cfg(feature = "quic-dgram")]
             dgram_send_queue: dgram::DatagramQueue::new(
                 config.dgram_send_max_queue_len),
         });
@@ -2304,6 +2308,7 @@ impl Connection {
         }
 
         // Create DATAGRAM frame.
+        #[cfg(feature = "quic-dgram")]
         if pkt_type == packet::Type::Short &&
             left > frame::MAX_DGRAM_OVERHEAD &&
             !is_closing
@@ -2557,6 +2562,7 @@ impl Connection {
 
         self.sent_count += 1;
 
+        #[cfg(feature = "quic-dgram")]
         if self.dgram_send_queue.pending_bytes() >
             self.recovery.cwnd_available()
         {
@@ -3014,6 +3020,7 @@ impl Connection {
     /// }
     /// # Ok::<(), quiche::Error>(())
     /// ```
+    #[cfg(feature = "quic-dgram")]
     pub fn dgram_recv(&mut self, buf: &mut [u8]) -> Result<usize> {
         self.dgram_recv_queue.pop(buf)
     }
@@ -3046,6 +3053,7 @@ impl Connection {
     /// conn.dgram_send(b"hello")?;
     /// # Ok::<(), quiche::Error>(())
     /// ```
+    #[cfg(feature = "quic-dgram")]
     pub fn dgram_send(&mut self, buf: &[u8]) -> Result<()> {
         let max_payload_len = match self.dgram_max_writable_len() {
             Some(v) => v as usize,
@@ -3087,6 +3095,7 @@ impl Connection {
     /// conn.dgram_purge_outgoing(&|d:&[u8]| -> bool { d[0] == 0 });
     /// # Ok::<(), quiche::Error>(())
     /// ```
+    #[cfg(feature = "quic-dgram")]
     pub fn dgram_purge_outgoing<F: Fn(&[u8]) -> bool>(&mut self, f: F) {
         self.dgram_send_queue.purge(f);
     }
@@ -3113,6 +3122,7 @@ impl Connection {
     /// }
     /// # Ok::<(), quiche::Error>(())
     /// ```
+    #[cfg(feature = "quic-dgram")]
     pub fn dgram_max_writable_len(&self) -> Option<usize> {
         match self.peer_transport_params.max_datagram_frame_size {
             None => None,
@@ -3418,12 +3428,18 @@ impl Connection {
             }
         }
 
+        #[allow(unused_variables)]
+        let dgram_pending = false;
+
+        #[cfg(feature = "quic-dgram")]
+        let dgram_pending = self.dgram_send_queue.has_pending();
+
         // If there are flushable, almost full or blocked streams, use the
         // Application epoch.
         if (self.is_established() || self.is_in_early_data()) &&
             (self.almost_full ||
                 self.blocked_limit.is_some() ||
-                self.dgram_send_queue.has_pending() ||
+                dgram_pending ||
                 self.streams.should_update_max_streams_bidi() ||
                 self.streams.should_update_max_streams_uni() ||
                 self.streams.has_flushable() ||
@@ -3779,6 +3795,7 @@ impl Connection {
                 self.drop_epoch_state(packet::EPOCH_HANDSHAKE);
             },
 
+            #[cfg(feature = "quic-dgram")]
             frame::Frame::Datagram { data } => {
                 // Close the connection if datagrams are not enabled.
                 // quiche always advertises support for 64K sized datagram
