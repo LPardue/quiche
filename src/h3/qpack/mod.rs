@@ -275,13 +275,21 @@ fn encode_int(
     Ok(())
 }
 
-pub fn decode_int2(buf: &[u8], prefix: usize) -> Result<(usize, u64)> {
+// Try to read a QPACK prefixed-integer from the supplied buffer.
+//
+// This function does not consume bytes from the buffer.
+//
+// On success, the decoded integer value is returned, along with the number of
+// bytes required to read it.
+//
+// Error::BufferTooShort is returned if the supplied buffer is not large
+// enough to decode the integer using the supplied prefix.
+pub fn try_decode_int(buf: &[u8], prefix: usize) -> Result<(usize, u64)> {
     let mask = 2u64.pow(prefix as u32) - 1;
 
     let mut offset = 0;
 
-    let mut val =
-        u64::from(*buf.get(offset).ok_or(Error::BufferTooShort)?);
+    let mut val = u64::from(*buf.get(offset).ok_or(Error::BufferTooShort)?);
     // error!("decode_int2 val={}", val);
     val &= mask;
 
@@ -294,7 +302,7 @@ pub fn decode_int2(buf: &[u8], prefix: usize) -> Result<(usize, u64)> {
     let mut shift = 0;
 
     while let Some(byte) = buf.get(offset) {
-        // error!("decode_int2 loop");
+        // error!("try_decode_int loop");
         offset += 1;
 
         let inc = u64::from(byte & 0b0111_1111)
@@ -373,7 +381,7 @@ mod tests {
 
         let mut dec = Decoder::new(256);
         let (size, decoded_insert_count) =
-            dec.decode_req_insert_count2(&encoded).unwrap();
+            dec.try_decode_req_insert_count(&encoded).unwrap();
         assert_eq!(
             dec.decode(&mut encoded[size..], decoded_insert_count, std::u64::MAX),
             Ok(headers)
@@ -463,7 +471,7 @@ mod tests {
         let hdr = h3::Header::new(":path", "thewrongpath");
         off += enc.insert(&mut buf[off..], &hdr, 1, false).unwrap();
 
-        off += enc.duplicate(&mut buf[off..], 0).unwrap();
+        enc.duplicate(&mut buf[off..], 0).unwrap();
 
         off = 0;
         let (size, _) = dec.control(&mut buf[off..]).unwrap();
@@ -518,7 +526,7 @@ mod tests {
 
         off += dec.header_ack(&mut buf[off..], 123).unwrap();
         off += dec.stream_cancel(&mut buf[off..], 456).unwrap();
-        off += dec.insert_count_increment(&mut buf[off..], 789).unwrap();
+        dec.insert_count_increment(&mut buf[off..], 789).unwrap();
 
         off = 0;
         let (size, _) = enc.control(&mut buf[off..]).unwrap();

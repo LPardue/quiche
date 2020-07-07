@@ -63,6 +63,7 @@ impl Decoder {
         }
     }
 
+    // TODO LP
     fn lookup_dynamic_with_absolute_index(
         &mut self, index: u64,
     ) -> Result<&mut TableEntry> {
@@ -270,49 +271,21 @@ impl Decoder {
         self.total_insert_count
     }
 
-    pub fn decode_req_insert_count3(
-        &self, encoded_insert_count: u64,
-    ) -> Result<u64> {
-        if encoded_insert_count == 0 {
-            return Ok(0);
-        }
-
-        let max_entries = self.max_table_capacity / 32;
-        let full_range = 2 * max_entries;
-
-        trace!("self.max_cap={} max_entries={} encoded_insert_count={} full_range={}", self.max_table_capacity, max_entries, encoded_insert_count, full_range);
-
-        if encoded_insert_count > full_range {
-            trace!("fudge 1");
-            return Err(Error::DecompressionFailed);
-        }
-
-        let max_value = self.total_insert_count + max_entries;
-        let max_wrapped = (max_value / full_range) * full_range;
-        let mut req_insert_count = max_wrapped + encoded_insert_count - 1;
-
-        if req_insert_count > max_value {
-            if req_insert_count <= full_range {
-                trace!("fudge 2");
-                return Err(Error::DecompressionFailed);
-            }
-            req_insert_count -= full_range;
-        }
-
-        if req_insert_count == 0 {
-            trace!("fudge 3");
-            return Err(Error::DecompressionFailed);
-        }
-
-        Ok(req_insert_count)
-    }
-
-    // returns the (length, val) where length is the number of bytes needed to
-    // consume the value TODO LP this is the GOOD one!!!!!!
-    pub fn decode_req_insert_count2(&self, buf: &[u8]) -> Result<(usize, u64)> {
+    // Try to read Required Insert Count from the supplied buffer.
+    //
+    // This function does not consume bytes from the buffer.
+    //
+    // On success, the decoded Required Insert Count value is returned, along
+    // with the number of bytes required to read it.
+    //
+    // Error::BufferTooShort is returned if the supplied buffer is not large
+    // enough to decode the integer using the supplied prefix.
+    pub fn try_decode_req_insert_count(
+        &self, buf: &[u8],
+    ) -> Result<(usize, u64)> {
         // error!("size before={}", 0);
         let (size, encoded_insert_count) =
-            decode_int2(buf, rep_prefix::REQUIRED_INSERT_COUNT)?;
+            try_decode_int(buf, rep_prefix::REQUIRED_INSERT_COUNT)?;
 
         // error!("size after={}", size);
 
@@ -350,53 +323,14 @@ impl Decoder {
         Ok((size, req_insert_count))
     }
 
-    fn decode_req_insert_count(&self, b: &mut octets::Octets) -> Result<u64> {
-        // error!("b.off() before={}", b.off());
-        let encoded_insert_count =
-            decode_int(b, rep_prefix::REQUIRED_INSERT_COUNT)?;
-        // error!("b.off() after={}", b.off());
-
-        if encoded_insert_count == 0 {
-            return Ok(0);
-        }
-
-        let max_entries = self.max_table_capacity / 32;
-        let full_range = 2 * max_entries;
-
-        trace!("self.max_cap={} max_entries={} encoded_insert_count={} full_range={}", self.max_table_capacity, max_entries, encoded_insert_count, full_range);
-
-        if encoded_insert_count > full_range {
-            trace!("fudge 1");
-            return Err(Error::DecompressionFailed);
-        }
-
-        let max_value = self.total_insert_count + max_entries;
-        let max_wrapped = (max_value / full_range) * full_range;
-        let mut req_insert_count = max_wrapped + encoded_insert_count - 1;
-
-        if req_insert_count > max_value {
-            if req_insert_count <= full_range {
-                trace!("fudge 2");
-                return Err(Error::DecompressionFailed);
-            }
-            req_insert_count -= full_range;
-        }
-
-        if req_insert_count == 0 {
-            trace!("fudge 3");
-            return Err(Error::DecompressionFailed);
-        }
-
-        Ok(req_insert_count)
-    }
-
+    // TODO LP
     fn decode_base2(
         buf: &[u8], required_insert_count: u64,
     ) -> Result<(usize, u64)> {
         let first = buf.first().ok_or(Error::BufferTooShort)?;
         let s = first & 0b1000_0000 == 0b1000_0000;
 
-        let (size, delta_base) = decode_int2(buf, rep_prefix::BASE)?;
+        let (size, delta_base) = try_decode_int(buf, rep_prefix::BASE)?;
 
         let value = if s {
             required_insert_count - delta_base - 1
@@ -434,42 +368,21 @@ impl Decoder {
 
         let mut left = max_size;
 
-        let mut offset = 0;
-
         let mut b = octets::Octets::with_slice(buf);
-
-        // let (size,req_insert_count2) = self.decode_req_insert_count2(buf)?;
-        // offset+=size;
-        // let mut b = octets::Octets::with_slice(&buf[offset..]);
-        // let req_insert_count = self.decode_req_insert_count(&mut b)?;
-
-        // if req_insert_count != req_insert_count2 {
-        //    error!("WTF RIC req_insert_count={}, req_insert_count2={}",
-        // req_insert_count, req_insert_count2);
-        //}
-
-        // assert_eq!(req_insert_count, req_insert_count2);
 
         let base = Decoder::decode_base(&mut b, req_insert_count)?;
 
-        // TODO: don't consume bytes until we know we're not blocked
-        // let (size,req_insert_count) =
-        // self.decode_req_insert_count2(&buf[offset..])?; offset+=size;
-
-        // let (size, base) = Decoder::decode_base2(&buf[offset..],
-        // req_insert_count)?; offset+=size;
-
-        error!(
+        trace!(
             "Header req_insert_count={} base={} total_insert_count={}",
-            req_insert_count, base, self.total_insert_count
+            req_insert_count,
+            base,
+            self.total_insert_count
         );
 
         if req_insert_count > self.total_insert_count {
             trace!("oh shit");
             return Err(Error::Blocked);
         }
-
-        // let mut b = octets::Octets::with_slice(&buf[offset..]);
 
         while b.cap() > 0 {
             trace!("cap={}", b.cap());
@@ -823,8 +736,11 @@ mod tests {
         decoder.total_insert_count = 10;
 
         let mut encoded = [0b00100];
-        let mut b = octets::Octets::with_slice(&mut encoded);
-        assert_eq!(decoder.decode_req_insert_count(&mut b).unwrap(), 9);
+        // let mut b = octets::Octets::with_slice(&mut encoded);
+        assert_eq!(
+            decoder.try_decode_req_insert_count(&encoded).unwrap(),
+            (1, 9)
+        );
     }
 
     #[test]

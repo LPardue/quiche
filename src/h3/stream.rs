@@ -460,7 +460,7 @@ impl Stream {
         &mut self, decoder: &crate::h3::qpack::Decoder,
     ) -> Result<u64> {
         let (size, decoded_insert_count) =
-            match decoder.decode_req_insert_count2(&self.state_buf) {
+            match decoder.try_decode_req_insert_count(&self.state_buf) {
                 Ok(v) => v,
 
                 Err(crate::h3::qpack::Error::BufferTooShort) => {
