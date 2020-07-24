@@ -27,15 +27,24 @@
 #[macro_use]
 extern crate log;
 
+use std::convert::TryFrom;
 use std::net;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use ring::rand::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
-const SIDUCK_ALPN: &[u8] = b"\x06siduck";
+const SIDUCK_ALPN: &[u8] = b"\x06siduck\x09siduck-00";
+const QUICTRANSPORT_ALPN: &[u8] = b"\x09wq-vvv-01";
+
+struct ApplicationParameters {
+    proto: &'static [u8],
+    initial_max_streams_bidi: u64,
+    initial_max_streams_uni: u64,
+}
 
 const USAGE: &str = "Usage:
   dgram-server [options]
@@ -49,21 +58,30 @@ Options:
   --name <str>                Name of the server [default: quic.tech]
   --max-data BYTES            Connection-wide flow control limit [default: 10000000].
   --max-stream-data BYTES     Per-stream flow control limit [default: 1000000].
-  --max-streams-bidi STREAMS  Number of allowed concurrent streams [default: 0].
-  --max-streams-uni STREAMS   Number of allowed concurrent streams [default: 3].
   --no-retry                  Disable stateless retry.
   --no-grease                 Don't send GREASE.
-  -a --app-proto PROTO        Application protocol (h3, siduck) on which to send DATAGRAM [default: siduck]
+  -a --app-proto PROTO        Application protocol (siduck, h3, wq-vvv) on which to send DATAGRAM [default: siduck]
+  --max-idle-timeout MS       Advertised timeout in milliseconds [default: 60000].
   -h --help                   Show this screen.
 ";
+
+type WebTransportStreamMap = HashMap<u64, Vec<u8>>;
 
 struct Client {
     conn: std::pin::Pin<Box<quiche::Connection>>,
 
     http3_conn: Option<quiche::h3::Connection>,
+
+    quictransport_conn: Option<()>,
+
+    qt_streams: WebTransportStreamMap,
+    qt_streams_complete: HashSet<u64>,
+
+    next_uni_stream_id: u64
 }
 
 type ClientMap = HashMap<Vec<u8>, (net::SocketAddr, Client)>;
+
 
 fn main() {
     let mut buf = [0; 65535];
@@ -84,17 +102,32 @@ fn main() {
     let max_stream_data = args.get_str("--max-stream-data");
     let max_stream_data = u64::from_str_radix(max_stream_data, 10).unwrap();
 
-    let max_streams_bidi = args.get_str("--max-streams-bidi");
-    let max_streams_bidi = u64::from_str_radix(max_streams_bidi, 10).unwrap();
+    let max_idle_timeout = args.get_str("--max-idle-timeout");
+    let max_idle_timeout = u64::from_str_radix(max_idle_timeout, 10).unwrap();
 
-    let max_streams_uni = args.get_str("--max-streams-uni");
-    let max_streams_uni = u64::from_str_radix(max_streams_uni, 10).unwrap();
+    // let max_streams_uni = args.get_str("--max-streams-uni");
+    // let max_streams_uni = u64::from_str_radix(max_streams_uni, 10).unwrap();
 
     let app_proto = args.get_str("--app-proto");
-    let alpn_proto = match app_proto {
-        "h3" => quiche::h3::APPLICATION_PROTOCOL,
 
-        "siduck" => SIDUCK_ALPN,
+    let app_params = match app_proto {
+        "siduck" => ApplicationParameters {
+            proto: SIDUCK_ALPN,
+            initial_max_streams_bidi: 0,
+            initial_max_streams_uni: 0,
+        },
+
+        "h3" => ApplicationParameters {
+            proto: quiche::h3::APPLICATION_PROTOCOL,
+            initial_max_streams_bidi: 100,
+            initial_max_streams_uni: 3,
+        },
+
+        "wq-vvv" => ApplicationParameters {
+            proto: QUICTRANSPORT_ALPN,
+            initial_max_streams_bidi: 10,
+            initial_max_streams_uni: 10,
+        },
 
         _ => panic!("Application protocol \"{}\" not supported", app_proto),
     };
@@ -125,16 +158,16 @@ fn main() {
         .load_priv_key_from_pem_file(args.get_str("--key"))
         .unwrap();
 
-    config.set_application_protos(alpn_proto).unwrap();
+    config.set_application_protos(app_params.proto).unwrap();
 
-    config.set_max_idle_timeout(5000);
+    config.set_max_idle_timeout(max_idle_timeout);
     config.set_max_udp_payload_size(MAX_DATAGRAM_SIZE as u64);
     config.set_initial_max_data(max_data);
     config.set_initial_max_stream_data_bidi_local(max_stream_data);
     config.set_initial_max_stream_data_bidi_remote(max_stream_data);
     config.set_initial_max_stream_data_uni(max_stream_data);
-    config.set_initial_max_streams_bidi(max_streams_bidi);
-    config.set_initial_max_streams_uni(max_streams_uni);
+    config.set_initial_max_streams_bidi(app_params.initial_max_streams_bidi);
+    config.set_initial_max_streams_uni(app_params.initial_max_streams_uni);
     config.set_disable_active_migration(true);
     config.set_dgram_frames_supported(true);
 
@@ -145,6 +178,8 @@ fn main() {
     if args.get_bool("--no-grease") {
         config.grease(false);
     }
+
+    let mut qt_client_indication_ok = false;
 
     let h3_config = quiche::h3::Config::new().unwrap();
 
@@ -221,7 +256,7 @@ fn main() {
             {
                 if hdr.ty != quiche::Type::Initial {
                     error!("Packet is not Initial");
-                    continue;
+                    continue 'read;
                 }
 
                 if !quiche::version_is_supported(hdr.version) {
@@ -241,7 +276,7 @@ fn main() {
 
                         panic!("send() failed: {:?}", e);
                     }
-                    continue;
+                    continue 'read;
                 }
 
                 let mut scid = [0; quiche::MAX_CONN_ID_LEN];
@@ -268,6 +303,7 @@ fn main() {
                             &mut out,
                         )
                         .unwrap();
+
                         let out = &out[..len];
 
                         if let Err(e) = socket.send_to(out, &src) {
@@ -278,7 +314,7 @@ fn main() {
 
                             panic!("send() failed: {:?}", e);
                         }
-                        continue;
+                        continue 'read;
                     }
 
                     odcid = validate_token(&src, token);
@@ -311,6 +347,10 @@ fn main() {
                 let client = Client {
                     conn,
                     http3_conn: None,
+                    quictransport_conn: None,
+                    qt_streams: WebTransportStreamMap::new(),
+                    qt_streams_complete: HashSet::new(),
+                    next_uni_stream_id: 3
                 };
 
                 clients.insert(scid.to_vec(), (src, client));
@@ -328,14 +368,9 @@ fn main() {
             let read = match client.conn.recv(pkt_buf) {
                 Ok(v) => v,
 
-                Err(quiche::Error::Done) => {
-                    trace!("{} done reading", client.conn.trace_id());
-                    break;
-                },
-
                 Err(e) => {
                     error!("{} recv failed: {:?}", client.conn.trace_id(), e);
-                    break 'read;
+                    continue 'read;
                 },
             };
 
@@ -343,7 +378,7 @@ fn main() {
 
             // If we negotiated SiDUCK, once the QUIC connection is established
             // try to read DATAGRAMs.
-            if alpn_proto == SIDUCK_ALPN &&
+            if app_params.proto == SIDUCK_ALPN &&
                 (client.conn.is_in_early_data() ||
                     client.conn.is_established())
             {
@@ -367,7 +402,7 @@ fn main() {
                                 Err(e) => panic!("error closing conn: {:?}", e),
                             }
 
-                            break;
+                            continue 'read;
                         }
 
                         match client
@@ -378,7 +413,7 @@ fn main() {
 
                             Err(e) => {
                                 error!("failed to send request {:?}", e);
-                                break;
+                                continue 'read;
                             },
                         }
                     },
@@ -388,14 +423,140 @@ fn main() {
                     Err(e) => {
                         error!("failure receiving DATAGRAM failure {:?}", e);
 
-                        break 'read;
+                        continue 'read;
+                    },
+                }
+            }
+
+            // If we negotiated QuicTransport, create a new QuicTransport
+            // connection as soon as the QUIC connection is
+            // established.
+            if app_params.proto == QUICTRANSPORT_ALPN &&
+                (client.conn.is_in_early_data() ||
+                    client.conn.is_established()) &&
+                client.quictransport_conn.is_none()
+            {
+                debug!(
+                    "{} QUIC handshake completed, now trying QuicTransport",
+                    client.conn.trace_id()
+                );
+
+                // TODO: sanity check connection before adding to map
+                client.quictransport_conn = Some(());
+            }
+
+            if client.quictransport_conn.is_some() {
+                // Process all readable streams.
+                for s in client.conn.readable() {
+                    while let Ok((read, fin)) =
+                        client.conn.stream_recv(s, &mut buf)
+                    {
+
+                        debug!(
+                            "{} received {} bytes on stream {}",
+                            client.conn.trace_id(),
+                            read,
+                            s
+                        );
+
+                        if client.qt_streams_complete.contains(&s) {
+                            return;
+                        }
+
+                        let qt_stream_data =
+                            client.qt_streams.entry(s).or_insert(Vec::new());
+
+
+                        trace!(
+                            "{} steam {} has {} bytes total",
+                            client.conn.trace_id(),
+                            s,
+                            qt_stream_data.len()
+                        );
+
+
+                        qt_stream_data.extend_from_slice(&buf[..read]);
+
+                        trace!(
+                            "{} steam {} now has {} bytes total",
+                            client.conn.trace_id(),
+                            s,
+                            qt_stream_data.len()
+                        );
+
+                        if fin {
+                            if s == 2 {
+                                qt_client_indication_ok =
+                                    process_client_indication(qt_stream_data);
+
+                                if !qt_client_indication_ok {
+                                    error!("{} QuicTransport client indication failure", client.conn.trace_id());
+
+                                    client.conn.close(false, 0x1, b"QuicTransport client indication fail").ok();
+                                }
+                            } else if qt_client_indication_ok {
+                                let stream_id = if s % 4 == 0 {
+                                    s
+                                } else {
+                                    let ret = client.next_uni_stream_id;
+                                    client.next_uni_stream_id += 4;
+                                    ret
+                                };
+
+                                let len = qt_stream_data.len().to_string();
+
+                                trace!(
+                                    "about to reply on stream {} with {:?}",
+                                    stream_id,
+                                    len
+                                );
+
+                                client
+                                    .conn
+                                    .stream_send(stream_id, len.as_bytes(), true)
+                                    .unwrap();
+
+                                client.qt_streams_complete.insert(s);
+
+                            }
+                        }
+                    }
+                }
+
+                match client.conn.dgram_recv(&mut dgram_buf) {
+                    Ok(len) => {
+                        let data = unsafe {
+                            std::str::from_utf8_unchecked(&dgram_buf[..len])
+                        };
+                        info!("Received DATAGRAM data {:?}", data);
+
+                        // TODO
+                        match client
+                            .conn
+                            .dgram_send(format!("{}", len).as_bytes())
+                        {
+                            Ok(v) => v,
+
+                            Err(e) => {
+                                error!("failed to send dgram bytes back {:?}", e);
+                                continue 'read;
+                            },
+                        }
+                    },
+
+                    Err(quiche::Error::Done) => continue 'read,
+
+                    Err(e) => {
+                        error!("failure receiving DATAGRAM failure {:?}", e);
+
+                        continue 'read;
                     },
                 }
             }
 
             // If we negotiated HTTP/3, create a new HTTP/3 connection as soon
             // as the QUIC connection is established.
-            if alpn_proto == quiche::h3::APPLICATION_PROTOCOL &&
+            if app_params.proto == quiche::h3::APPLICATION_PROTOCOL &&
                 (client.conn.is_in_early_data() ||
                     client.conn.is_established()) &&
                 client.http3_conn.is_none()
@@ -413,7 +574,7 @@ fn main() {
 
                     Err(e) => {
                         error!("failed to create HTTP/3 connection: {}", e);
-                        break 'read;
+                        continue 'read;
                     },
                 };
 
@@ -583,4 +744,52 @@ fn hex_dump(buf: &[u8]) -> String {
     let vec: Vec<String> = buf.iter().map(|b| format!("{:02x}", b)).collect();
 
     vec.join("")
+}
+
+fn process_client_indication(buf: &[u8]) -> bool {
+    let mut offset = 0;
+
+    // origin
+    let tmp = <[u8; 2]>::try_from(&buf[offset..offset + 2]).unwrap();
+    let field = u16::from_be_bytes(tmp);
+    if field != 0 {
+        trace!("field key != 0");
+        return false;
+    }
+
+    offset += 2;
+
+    let tmp = <[u8; 2]>::try_from(&buf[offset..offset + 2]).unwrap();
+    let origin_len = u16::from_be_bytes(tmp);
+    trace!("origin_len={}", origin_len);
+    offset += 2;
+
+    let origin =
+        std::str::from_utf8(&buf[offset..offset + origin_len as usize]).unwrap();
+
+    offset += origin_len as usize;
+
+    // path
+    let tmp = <[u8; 2]>::try_from(&buf[offset..offset + 2]).unwrap();
+    let field = u16::from_be_bytes(tmp);
+    if field != 1 {
+        error!("field key != 1");
+        return false;
+    }
+
+    offset += 2;
+
+    let tmp = <[u8; 2]>::try_from(&buf[offset..offset + 2]).unwrap();
+    let path_len = u16::from_be_bytes(tmp);
+
+    offset += 2;
+
+    let path =
+        std::str::from_utf8(&buf[offset..offset + path_len as usize]).unwrap();
+
+    // TODO: validate origin
+    // let url1 = url::Url::parse(origin);
+    // let url2 = url::Url::parse(path);
+
+    true
 }

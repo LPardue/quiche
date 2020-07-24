@@ -34,6 +34,7 @@ use ring::rand::*;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 const SIDUCK_ALPN: &[u8] = b"\x06siduck\x09siduck-00";
+const QUICTRANSPORT_ALPN: &[u8] = b"\x09wq-vvv-01";
 
 struct ApplicationParameters {
     proto: &'static [u8],
@@ -52,7 +53,7 @@ Options:
   --no-verify              Don't verify server's certificate.
   --no-grease              Don't send GREASE.
   --max-dgram-frame BYTES  Maximum DATAGRAM frame size [default: 500].
-  -a --app-proto PROTO     Application protocol (siduck, wq-vvv) on which to send DATAGRAM [default: siduck]
+  -a --app-proto PROTO     Application protocol (siduck, h3, wq-vvv) on which to send DATAGRAM [default: siduck]
   -d --data DATA           The DATAGRAM frame data [default: quack].
   -n --datagrams DGRAMS    Send the given number of identical DATAGRAM frames [default: 1].
   -h --help                Show this screen.
@@ -82,23 +83,31 @@ fn main() {
 
     let url = url::Url::parse(args.get_str("URL")).unwrap();
 
-    let app_proto = args.get_str("--app-proto");
+    let mut app_proto = args.get_str("--app-proto");
 
     if url.scheme() == "quic-transport" && app_proto != "wq-vvv" {
-        warn!("\"quic-transport\" scheme provided with incompatible ALPN, correcting the ALPN")
+        warn!("\"quic-transport\" scheme provided with incompatible ALPN, correcting the ALPN");
+
+        app_proto = "wq-vvv";
     }
 
     let app_params = match app_proto {
+        "siduck" => ApplicationParameters {
+            proto: SIDUCK_ALPN,
+            initial_max_streams_bidi: 0,
+            initial_max_streams_uni: 0,
+        },
+
         "h3" => ApplicationParameters {
             proto: quiche::h3::APPLICATION_PROTOCOL,
             initial_max_streams_bidi: 100,
             initial_max_streams_uni: 3,
         },
 
-        "siduck" => ApplicationParameters {
-            proto: SIDUCK_ALPN,
-            initial_max_streams_bidi: 0,
-            initial_max_streams_uni: 0,
+        "wq-vvv" => ApplicationParameters {
+            proto: QUICTRANSPORT_ALPN,
+            initial_max_streams_bidi: 10,
+            initial_max_streams_uni: 10,
         },
 
         _ => panic!("Application protocol \"{}\" not supported", app_proto),
@@ -109,7 +118,13 @@ fn main() {
     let dgrams_count = args.get_str("--datagrams");
     let dgrams_count = u64::from_str_radix(dgrams_count, 10).unwrap();
 
-    let mut dgrams_complete = 0;
+    let mut dgram_echoes = 0;
+    let mut dgrams_complete = false;
+
+    let honk_count = 2;
+    let mut honk_echoes = 0;
+    let mut honks_sent = false;
+    let mut honks_complete = false;
 
     // Setup the event loop.
     let poll = mio::Poll::new().unwrap();
@@ -159,6 +174,7 @@ fn main() {
     config.set_dgram_frames_supported(true);
 
     let mut http3_conn = None;
+    let mut quictransport_conn: Option<()> = None;
 
     if args.get_bool("--no-verify") {
         config.verify_peer(false);
@@ -168,7 +184,16 @@ fn main() {
         config.grease(false);
     }
 
-    if std::env::var_os("SSLKEYLOGFILE").is_some() {
+    let mut keylog = None;
+    if let Some(keylog_path) = std::env::var_os("SSLKEYLOGFILE") {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(keylog_path)
+            .unwrap();
+
+        keylog = Some(file);
+
         config.log_keys();
     }
 
@@ -185,6 +210,12 @@ fn main() {
         socket.local_addr().unwrap(),
         hex_dump(&scid)
     );
+
+    if let Some(keylog) = &mut keylog {
+        if let Ok(keylog) = keylog.try_clone() {
+            conn.set_keylog(Box::new(keylog));
+        }
+    }
 
     let write = conn.send(&mut out).expect("initial send failed");
 
@@ -266,17 +297,17 @@ fn main() {
                         };
 
                         info!("Received DATAGRAM data {:?}", data);
-                        dgrams_complete += 1;
+                        dgram_echoes += 1;
 
                         debug!(
                             "{}/{} dgrams received",
-                            dgrams_complete, dgrams_count
+                            dgram_echoes, dgrams_count
                         );
 
-                        if dgrams_complete == dgrams_count {
+                        if dgram_echoes == dgrams_count {
                             info!(
                                 "{}/{} dgrams(s) received in {:?}, closing...",
-                                dgrams_complete,
+                                dgram_echoes,
                                 dgrams_count,
                                 dgram_start.elapsed()
                             );
@@ -301,14 +332,103 @@ fn main() {
                     },
                 }
             }
+
+            // If we negotiated WebTransport, once the QUIC connection is
+            // established try to read DATAGRAMs.
+            if let Some(_) = &mut quictransport_conn {
+
+
+                for s in conn.readable() {
+                    while let Ok((read, fin)) = conn.stream_recv(s, &mut buf) {
+                        debug!("{} received {} bytes", conn.trace_id(), read);
+
+                        let stream_buf = &buf[..read];
+
+                        debug!(
+                            "stream {} has {} bytes (fin? {})",
+                            s,
+                            stream_buf.len(),
+                            fin
+                        );
+
+                        // TODO: store all received data and only check when fin'd
+                        unsafe {
+                            let echoed_len: usize =
+                                std::str::from_utf8_unchecked(&stream_buf)
+                                    .parse()
+                                    .unwrap();
+
+                            if echoed_len == b"HONK".len() {
+                                honk_echoes += 1;
+
+                                if honk_echoes == honk_count {
+                                    honks_complete = true;
+                                }
+                            }
+                        };
+
+                        if fin {
+                            info!("stream {} closed", s);
+                        }
+                    }
+                }
+
+                match conn.dgram_recv(&mut dgram_buf) {
+                    Ok(len) => {
+                        let data = unsafe {
+                            std::str::from_utf8_unchecked(&dgram_buf[..len])
+                        };
+
+                        info!("Received DATAGRAM data {:?}", data);
+                        dgram_echoes += 1;
+
+                        debug!(
+                            "{}/{} dgrams received",
+                            dgram_echoes, dgrams_count
+                        );
+
+                        if dgram_echoes == dgrams_count {
+                            info!(
+                                "{}/{} dgrams(s) received in {:?}",
+                                dgram_echoes,
+                                dgrams_count,
+                                dgram_start.elapsed()
+                            );
+
+                            dgrams_complete = true;
+
+                        }
+                    },
+
+                    Err(quiche::Error::Done) => (),
+
+                    Err(e) => {
+                        error!("failure receiving DATAGRAM failure {:?}", e);
+
+                        break 'read;
+                    },
+                }
+
+                if honks_complete && dgrams_complete {
+                    info!("All datagram and stream data was echoed, closing...");
+                    match conn.close(true, 0x00, b"kthxbye") {
+                        // Already closed.
+                        Ok(_) | Err(quiche::Error::Done) => (),
+
+                        Err(e) => panic!("error closing conn: {:?}", e),
+                    }
+
+                    break 'read;
+                }
+            }
         }
 
         if conn.is_closed() {
             info!("connection closed, {:?}", conn.stats());
 
-            if dgrams_complete != dgrams_count {
+            if dgram_echoes != dgrams_count {
                 error!("connection timed out after {:?} and only completed {}/{} requests",
-                       dgram_start.elapsed(), dgrams_complete, dgrams_count);
+                       dgram_start.elapsed(), dgram_echoes, dgrams_count);
             }
 
             break;
@@ -373,6 +493,77 @@ fn main() {
             dgrams_sent += dgrams_done;
         }
 
+        // If we negotiated QuicTransport, once the QUIC connection is established
+        // send the QuicTransport client indication and send datagrams.
+        if app_params.proto == QUICTRANSPORT_ALPN &&
+            conn.is_established() &&
+            quictransport_conn.is_none()
+        {
+            let mut path = String::from(url.path());
+
+            if let Some(query) = url.query() {
+                path.push('?');
+                path.push_str(query);
+            }
+
+            let mut d: Vec<u8> = Vec::new();
+
+            // Origin Field
+            let field_id: u16 = 0;
+            d.extend_from_slice(&field_id.to_be_bytes());
+
+            let origin = &url[..url::Position::BeforePath];
+            d.extend_from_slice(&(origin.len() as u16).to_be_bytes());
+            d.extend_from_slice(origin.as_bytes());
+
+            // Path Field
+            let field_id: u16 = 1;
+            d.extend_from_slice(&field_id.to_be_bytes());
+            let path = &url[url::Position::BeforePath..];
+            d.extend_from_slice(&(path.len() as u16).to_be_bytes());
+            d.extend_from_slice(path.as_bytes());
+
+            trace!("sending client indication {:?}...", d);
+
+            conn.stream_send(2, &d, true).ok();
+
+            quictransport_conn = Some(());
+        }
+
+        // Once the QuicTransport connection is established, send all QUIC
+        // datagrams until all have been sent.
+        if let Some(_) = &mut quictransport_conn {
+            if !honks_sent {
+                debug!("Sending honks on stream 0 and 6");
+                conn.stream_send(0, b"HONK", true).unwrap();
+                conn.stream_send(6, b"HONK", true).unwrap();
+
+                honks_sent = true;
+            }
+
+            let mut dgrams_done = 0;
+
+            for _ in dgrams_sent..dgrams_count {
+                info!(
+                    "sending QuicTransport DATAGRAM with data {:?}",
+                    dgram_data
+                );
+
+                match conn.dgram_send(dgram_data.as_bytes()) {
+                    Ok(v) => v,
+
+                    Err(e) => {
+                        error!("failed to send dgram {:?}", e);
+                        break;
+                    },
+                }
+
+                dgrams_done += 1;
+            }
+
+            dgrams_sent += dgrams_done;
+        }
+
         if let Some(http3_conn) = &mut http3_conn {
             // Process HTTP/3 events.
             loop {
@@ -382,17 +573,17 @@ fn main() {
                             "Received DATAGRAM flow_id={} dat= {:?}",
                             flow_id, data
                         );
-                        dgrams_complete += 1;
+                        dgram_echoes += 1;
 
                         debug!(
                             "{}/{} dgrams received",
-                            dgrams_complete, dgrams_count
+                            dgram_echoes, dgrams_count
                         );
 
-                        if dgrams_complete == dgrams_count {
+                        if dgram_echoes == dgrams_count {
                             info!(
                                 "{}/{} dgrams(s) received in {:?}, closing...",
-                                dgrams_complete,
+                                dgram_echoes,
                                 dgrams_count,
                                 dgram_start.elapsed()
                             );
@@ -455,9 +646,9 @@ fn main() {
         if conn.is_closed() {
             info!("connection closed, {:?}", conn.stats());
 
-            if dgrams_complete != dgrams_count {
+            if dgram_echoes != dgrams_count {
                 error!("connection timed out after {:?} and only completed {}/{} requests",
-                       dgram_start.elapsed(), dgrams_complete, dgrams_count);
+                       dgram_start.elapsed(), dgram_echoes, dgrams_count);
             }
 
             break;
