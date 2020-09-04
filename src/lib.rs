@@ -3208,15 +3208,21 @@ impl Connection {
         match self.peer_transport_params.max_datagram_frame_size {
             None => None,
             Some(peer_frame_len) => {
+                // Sending dgrams is only in APPLICATION epoch
+                let epoch = packet::EPOCH_APPLICATION;
+                let crypto_overhead = self.pkt_num_spaces[epoch]
+                    .crypto_overhead()?;
+
                 // start from the maximum packet size
                 let mut max_len = self.max_send_udp_payload_len();
+
                 // subtract the Short packet header overhead
                 // (1 byte of pkt_len + len of dcid)
                 max_len = max_len.saturating_sub(1 + self.dcid.len());
                 // subtract the packet number (max len)
                 max_len = max_len.saturating_sub(packet::MAX_PKT_NUM_LEN);
                 // subtract the crypto overhead
-                max_len = max_len.saturating_sub(frame::MAX_CRYPTO_OVERHEAD);
+                max_len = max_len.saturating_sub(crypto_overhead);
                 // clamp to what peer can support
                 max_len = cmp::min(peer_frame_len as usize, max_len);
                 // subtract frame overhead, checked for underflow
