@@ -7614,6 +7614,9 @@ mod tests {
 
         let mut pipe = testing::Pipe::with_config(&mut config).unwrap();
 
+        // Before handshake (before peer settings) we don't know max dgram size
+        assert_eq!(pipe.client.dgram_max_writable_len(), None);
+
         assert_eq!(pipe.handshake(&mut buf), Ok(()));
 
         let max_dgram_size = pipe.client.dgram_max_writable_len().unwrap();
