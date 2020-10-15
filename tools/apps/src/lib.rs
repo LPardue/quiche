@@ -32,6 +32,8 @@
 #[macro_use]
 extern crate log;
 
+use std::net::ToSocketAddrs;
+
 use std::io::prelude::*;
 
 use std::collections::HashMap;
@@ -202,6 +204,8 @@ pub struct PartialResponse {
     pub body: Vec<u8>,
 
     pub written: usize,
+
+    pub fin: bool,
 }
 
 pub struct Client {
@@ -517,6 +521,36 @@ impl SiDuckConn {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum ProxyType {
+    Direct,
+    Http(String),
+    Udp(String),
+    Quic(String),
+}
+
+impl Default for ProxyType {
+    fn default() -> Self {
+        ProxyType::Direct
+    }
+}
+
+pub fn get_proxy_type() -> ProxyType {
+    if let Some(p) = std::env::var_os("HTTP_PROXY") {
+        return ProxyType::Http(p.to_str().unwrap().to_owned());
+    }
+
+    if let Some(p) = std::env::var_os("UDP_PROXY") {
+        return ProxyType::Udp(p.to_str().unwrap().to_owned());
+    }
+
+    if let Some(p) = std::env::var_os("QUIC_PROXY") {
+        return ProxyType::Quic(p.to_str().unwrap().to_owned());
+    }
+
+    ProxyType::Direct
+}
+
 /// Represents an HTTP/0.9 formatted request.
 pub struct Http09Request {
     url: url::Url,
@@ -526,27 +560,8 @@ pub struct Http09Request {
     response_writer: Option<std::io::BufWriter<std::fs::File>>,
 }
 
-/// Represents an HTTP/3 formatted request.
-struct Http3Request {
-    url: url::Url,
-    cardinal: u64,
-    stream_id: Option<u64>,
-    hdrs: Vec<quiche::h3::Header>,
-    response_hdrs: Vec<quiche::h3::Header>,
-    response_body: Vec<u8>,
-    response_writer: Option<std::io::BufWriter<std::fs::File>>,
-}
-
-#[derive(Default)]
-pub struct Http09Conn {
-    stream_id: u64,
-    reqs_sent: usize,
-    reqs_complete: usize,
-    reqs: Vec<Http09Request>,
-}
-
-impl Http09Conn {
-    pub fn with_urls(urls: &[url::Url], reqs_cardinal: u64) -> Box<dyn HttpConn> {
+impl Http09Request {
+    fn generate(urls: &[url::Url], reqs_cardinal: u64) -> Vec<Self> {
         let mut reqs = Vec::new();
         for url in urls {
             for i in 1..=reqs_cardinal {
@@ -560,6 +575,130 @@ impl Http09Conn {
                 });
             }
         }
+        reqs
+    }
+}
+
+#[derive(Debug)]
+pub struct Http11Request {
+    _url: url::Url,
+    _cardinal: u64,
+    request: String,
+    _stream_id: Option<u64>,
+    _response_writer: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl Http11Request {
+    fn generate(urls: &[url::Url], reqs_cardinal: u64) -> Vec<Self> {
+        let mut reqs = Vec::new();
+        for url in urls {
+            for i in 1..=reqs_cardinal {
+                let request = format!("GET {} HTTP/1.1\r\nhost: {}\r\nuser-agent: quiche-masque\r\n\r\n", url.path(), url.host_str().unwrap());
+                reqs.push(Http11Request {
+                    _url: url.clone(),
+                    _cardinal: i,
+                    request,
+                    _stream_id: None,
+                    _response_writer: None,
+                });
+            }
+        }
+        reqs
+    }
+}
+
+/// Represents an HTTP/3 formatted request.
+#[derive(Debug)]
+struct Http3Request {
+    url: url::Url,
+    cardinal: u64,
+    stream_id: Option<u64>,
+    hdrs: Vec<quiche::h3::Header>,
+    response_hdrs: Vec<quiche::h3::Header>,
+    response_body: Vec<u8>,
+    response_writer: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl Http3Request {
+    fn generate(
+        urls: &[url::Url], reqs_cardinal: u64, method: &str,
+        extra_headers: &[String], body_len: Option<usize>,
+    ) -> Vec<Self> {
+        let mut reqs = Vec::new();
+        for url in urls {
+            for i in 1..=reqs_cardinal {
+                let authority = format!(
+                    "{}:{}",
+                    url.host_str().unwrap(),
+                    url.port_or_known_default().unwrap()
+                );
+
+                let mut hdrs = match method {
+                    "CONNECT" | "CONNECT-UDP" => vec![
+                        quiche::h3::Header::new(":method", &method),
+                        quiche::h3::Header::new(":authority", &authority),
+                        quiche::h3::Header::new("user-agent", "quiche"),
+                    ],
+
+                    _ => vec![
+                        quiche::h3::Header::new(":method", &method),
+                        quiche::h3::Header::new(":scheme", url.scheme()),
+                        quiche::h3::Header::new(":authority", &authority),
+                        quiche::h3::Header::new(
+                            ":path",
+                            &url[url::Position::BeforePath..],
+                        ),
+                        quiche::h3::Header::new("user-agent", "quiche"),
+                    ],
+                };
+
+                // Add custom headers to the request.
+                for header in extra_headers {
+                    let header_split: Vec<&str> =
+                        header.splitn(2, ": ").collect();
+                    if header_split.len() != 2 {
+                        panic!("malformed header provided - \"{}\"", header);
+                    }
+
+                    hdrs.push(quiche::h3::Header::new(
+                        header_split[0],
+                        header_split[1],
+                    ));
+                }
+
+                if let Some(l) = body_len {
+                    hdrs.push(quiche::h3::Header::new(
+                        "content-length",
+                        &l.to_string(),
+                    ));
+                }
+
+                reqs.push(Http3Request {
+                    url: url.clone(),
+                    cardinal: i,
+                    stream_id: None,
+                    hdrs,
+                    response_hdrs: Vec::new(),
+                    response_body: Vec::new(),
+                    response_writer: None,
+                });
+            }
+        }
+        reqs
+    }
+}
+
+#[derive(Default)]
+pub struct Http09Conn {
+    stream_id: u64,
+    reqs_sent: usize,
+    reqs_complete: usize,
+    reqs: Vec<Http09Request>,
+}
+
+impl Http09Conn {
+    pub fn with_urls(urls: &[url::Url], reqs_cardinal: u64) -> Box<dyn HttpConn> {
+        let reqs = Http09Request::generate(urls, reqs_cardinal);
 
         let h_conn = Http09Conn {
             stream_id: 0,
@@ -795,6 +934,7 @@ impl HttpConn for Http09Conn {
                             headers: None,
                             body,
                             written,
+                            fin,
                         };
 
                         partial_responses.insert(s, response);
@@ -874,58 +1014,19 @@ impl Http3Conn {
         req_headers: &[String], body: &Option<Vec<u8>>, method: &str,
         dump_json: bool, dgram_sender: Option<Http3DgramSender>,
     ) -> Box<dyn HttpConn> {
-        let mut reqs = Vec::new();
-        for url in urls {
-            for i in 1..=reqs_cardinal {
-                let authority = match url.port() {
-                    Some(port) => format!("{}:{}", url.host_str().unwrap(), port),
+        // todo rustify this
+        let body_len = match body {
+            Some(b) => Some(b.len()),
+            None => None,
+        };
 
-                    None => url.host_str().unwrap().to_string(),
-                };
-
-                let mut hdrs = vec![
-                    quiche::h3::Header::new(":method", &method),
-                    quiche::h3::Header::new(":scheme", url.scheme()),
-                    quiche::h3::Header::new(":authority", &authority),
-                    quiche::h3::Header::new(
-                        ":path",
-                        &url[url::Position::BeforePath..],
-                    ),
-                    quiche::h3::Header::new("user-agent", "quiche"),
-                ];
-
-                // Add custom headers to the request.
-                for header in req_headers {
-                    let header_split: Vec<&str> =
-                        header.splitn(2, ": ").collect();
-                    if header_split.len() != 2 {
-                        panic!("malformed header provided - \"{}\"", header);
-                    }
-
-                    hdrs.push(quiche::h3::Header::new(
-                        header_split[0],
-                        header_split[1],
-                    ));
-                }
-
-                if body.is_some() {
-                    hdrs.push(quiche::h3::Header::new(
-                        "content-length",
-                        &body.as_ref().unwrap().len().to_string(),
-                    ));
-                }
-
-                reqs.push(Http3Request {
-                    url: url.clone(),
-                    cardinal: i,
-                    hdrs,
-                    response_hdrs: Vec::new(),
-                    response_body: Vec::new(),
-                    stream_id: None,
-                    response_writer: None,
-                });
-            }
-        }
+        let reqs = Http3Request::generate(
+            urls,
+            reqs_cardinal,
+            method,
+            req_headers,
+            body_len,
+        );
 
         let h_conn = Http3Conn {
             h3_conn: quiche::h3::Connection::with_transport(
@@ -1327,6 +1428,7 @@ impl HttpConn for Http3Conn {
                                 headers: Some(headers),
                                 body,
                                 written: 0,
+                                fin: false,
                             };
 
                             partial_responses.insert(stream_id, response);
@@ -1368,6 +1470,7 @@ impl HttpConn for Http3Conn {
                             headers: None,
                             body,
                             written,
+                            fin: true,
                         };
 
                         partial_responses.insert(stream_id, response);
@@ -1497,6 +1600,799 @@ impl HttpConn for Http3Conn {
 
         if resp.written == resp.body.len() {
             partial_responses.remove(&stream_id);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Upstream {
+    poll: mio::Poll,
+    events: mio::Events,
+    udp_socket: Option<std::net::UdpSocket>,
+    tcp_stream: Option<mio::tcp::TcpStream>,
+}
+
+#[derive(Debug)]
+struct ConnectContext {
+    connect_reqs: Vec<Http3Request>,
+    inner_h11_reqs: Option<Vec<Http11Request>>,
+    _inner_h3_reqs: Option<Vec<Http3Request>>,
+}
+
+type ContextMap = HashMap<String, ConnectContext>;
+
+pub struct MasqueConn {
+    h3_conn: quiche::h3::Connection,
+    reqs_sent: usize,
+    reqs_complete: usize,
+    client_view: ContextMap,
+    _body: Option<Vec<u8>>,
+    dgram_sender: Option<Http3DgramSender>,
+    upstreams: HashMap<u64, Upstream>,
+}
+
+impl MasqueConn {
+    pub fn with_urls(
+        conn: &mut quiche::Connection, urls: &[url::Url], reqs_cardinal: u64,
+        req_headers: &[String], body: &Option<Vec<u8>>, method: &str,
+        dgram_sender: Option<Http3DgramSender>, proxy_type: ProxyType,
+    ) -> Box<dyn HttpConn> {
+        // todo rustify this
+        let body_len = match body {
+            Some(b) => Some(b.len()),
+            None => None,
+        };
+
+        let mut client_view = ContextMap::new();
+
+        // From the given set of URLs:
+        // 1) find the unique target server, there will be one CONNECT to this
+        // 2) gather all URLs to the target, there will be one or more requests
+        //    that get tunneled on the stream created in (1).
+        for url in urls {
+            let authority = format!(
+                "{}:{}",
+                url.host_str().unwrap(),
+                url.port_or_known_default().unwrap()
+            );
+
+            match client_view.get_mut(&authority) {
+                Some(v) => match proxy_type {
+                    ProxyType::Http(_) => {
+                        let mut reqs = Http11Request::generate(
+                            &[url.clone()],
+                            reqs_cardinal,
+                        );
+                        v.inner_h11_reqs.as_mut().unwrap().append(&mut reqs);
+                    },
+
+                    ProxyType::Udp(_) => {
+                        let mut reqs = Http3Request::generate(
+                            &[url.clone()],
+                            reqs_cardinal,
+                            method,
+                            req_headers,
+                            body_len,
+                        );
+                        v._inner_h3_reqs.as_mut().unwrap().append(&mut reqs);
+                    },
+
+                    _ => (),
+                },
+
+                None => {
+                    let (conn_method, inner_h11_reqs, inner_h3_reqs) =
+                        match proxy_type {
+                            ProxyType::Http(_) => (
+                                "CONNECT",
+                                Some(Http11Request::generate(
+                                    &[url.clone()],
+                                    reqs_cardinal,
+                                )),
+                                None,
+                            ),
+
+                            // TODO: the CONNECT-UDP methods need some extra
+                            // headers. Figure out how to handle this.
+                            ProxyType::Udp(_) => (
+                                "CONNECT-UDP",
+                                None,
+                                Some(Http3Request::generate(
+                                    &[url.clone()],
+                                    reqs_cardinal,
+                                    method,
+                                    req_headers,
+                                    body_len,
+                                )),
+                            ),
+
+                            ProxyType::Quic(_) => ("CONNECT-UDP", None, None),
+
+                            _ => (method, None, None),
+                        };
+                    let cc = ConnectContext {
+                        connect_reqs: Http3Request::generate(
+                            &[url.clone()],
+                            1,
+                            conn_method,
+                            req_headers,
+                            None,
+                        ),
+                        inner_h11_reqs,
+                        _inner_h3_reqs: inner_h3_reqs,
+                    };
+                    client_view.insert(authority, cc);
+                },
+            }
+        }
+
+        let h_conn = MasqueConn {
+            h3_conn: quiche::h3::Connection::with_transport(
+                conn,
+                &quiche::h3::Config::new().unwrap(),
+            )
+            .unwrap(),
+            reqs_sent: 0,
+            reqs_complete: 0,
+            client_view,
+
+            _body: body.as_ref().map(|b| b.to_vec()),
+            dgram_sender,
+            upstreams: HashMap::new(),
+        };
+
+        Box::new(h_conn)
+    }
+
+    pub fn with_conn(
+        conn: &mut quiche::Connection, dgram_sender: Option<Http3DgramSender>,
+    ) -> Box<dyn HttpConn> {
+        let h_conn = MasqueConn {
+            h3_conn: quiche::h3::Connection::with_transport(
+                conn,
+                &quiche::h3::Config::new().unwrap(),
+            )
+            .unwrap(),
+            reqs_sent: 0,
+            reqs_complete: 0,
+            client_view: HashMap::new(),
+            _body: None,
+            dgram_sender,
+            upstreams: HashMap::new(),
+        };
+
+        Box::new(h_conn)
+    }
+
+    fn validate_tunnel_request(
+        request: &[quiche::h3::Header],
+    ) -> quiche::h3::Result<ProxyType> {
+        let mut scheme = None;
+        let mut host = None;
+        let mut path = None;
+        let mut method = None;
+
+        for hdr in request {
+            match hdr.name() {
+                ":scheme" => {
+                    scheme = Some(hdr.value());
+                },
+
+                ":authority" | "host" => {
+                    host = Some(hdr.value().to_string());
+                },
+
+                ":path" => {
+                    path = Some(hdr.value());
+                },
+
+                ":method" => {
+                    method = Some(hdr.value());
+                },
+
+                _ => (),
+            }
+        }
+
+        if scheme.is_some() || path.is_some() {
+            return Err(quiche::h3::Error::Done);
+        }
+
+        // TODO validate host
+
+        let proxy_type = match method {
+            Some("CONNECT") => ProxyType::Http(host.unwrap()),
+
+            Some("CONNECT-UDP") => {
+                // TODO: pick proxy mode based on headers
+                ProxyType::Udp(host.unwrap())
+            },
+
+            _ => {
+                return Err(quiche::h3::Error::Done);
+            },
+        };
+
+        trace!("proxy_type={:?}", proxy_type);
+
+        Ok(proxy_type)
+    }
+}
+
+impl HttpConn for MasqueConn {
+    fn send_requests(
+        &mut self, conn: &mut quiche::Connection, target_path: &Option<String>,
+    ) {
+        let mut reqs_done = 0;
+
+        for (target, context) in self.client_view.iter_mut().skip(self.reqs_sent)
+        {
+            debug!("sending HTTP CONNECT request for {}", target);
+
+            let req = context.connect_reqs.first_mut().unwrap();
+            let s = match self.h3_conn.send_request(conn, &req.hdrs, false) {
+                Ok(v) => v,
+
+                Err(quiche::h3::Error::TransportError(
+                    quiche::Error::StreamLimit,
+                )) => {
+                    debug!("not enough stream credits, retry later...");
+                    break;
+                },
+
+                Err(quiche::h3::Error::StreamBlocked) => {
+                    debug!("stream is blocked, retry later...");
+                    break;
+                },
+
+                Err(e) => {
+                    error!("failed to send request {:?}", e);
+                    break;
+                },
+            };
+
+            debug!("sending HTTP CONNECT request {:?}", req.hdrs);
+
+            req.stream_id = Some(s);
+            req.response_writer =
+                make_resource_writer(&req.url, target_path, req.cardinal);
+
+            if let Some(inner_reqs) = &context.inner_h11_reqs {
+                for inner_req in inner_reqs.iter() {
+                    if let Err(e) = self.h3_conn.send_body(
+                        conn,
+                        s,
+                        inner_req.request.as_bytes(),
+                        false,
+                    ) {
+                        error!("failed to send inner HTTP request {:?}", e);
+
+                        // TODO: store and retry
+                        break;
+                    }
+                }
+            }
+
+            reqs_done += 1;
+        }
+
+        self.reqs_sent += reqs_done;
+
+        if let Some(ds) = self.dgram_sender.as_mut() {
+            let mut dgrams_done = 0;
+
+            for _ in ds.dgrams_sent..ds.dgram_count {
+                info!(
+                    "sending HTTP/3 DATAGRAM on flow_id={} with data {:?}",
+                    ds.flow_id,
+                    ds.dgram_content.as_bytes()
+                );
+
+                match self.h3_conn.send_dgram(
+                    conn,
+                    0,
+                    ds.dgram_content.as_bytes(),
+                ) {
+                    Ok(v) => v,
+
+                    Err(e) => {
+                        error!("failed to send dgram {:?}", e);
+                        break;
+                    },
+                }
+
+                dgrams_done += 1;
+            }
+
+            ds.dgrams_sent += dgrams_done;
+        }
+    }
+
+    fn handle_responses(
+        &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
+        _req_start: &std::time::Instant,
+    ) {
+        trace!("handle_responses");
+        loop {
+            match self.h3_conn.poll(conn) {
+                Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                    info!(
+                        "got response headers {:?} on stream id {}",
+                        list, stream_id
+                    );
+                },
+
+                Ok((stream_id, quiche::h3::Event::Data)) => {
+                    if let Ok(read) = self.h3_conn.recv_body(conn, stream_id, buf)
+                    {
+                        debug!(
+                            "got {} bytes of response data on stream {}",
+                            read, stream_id
+                        );
+
+                        let entry = self
+                            .client_view
+                            .iter_mut()
+                            .find(|(_k, v)| {
+                                v.connect_reqs.first().unwrap().stream_id ==
+                                    Some(stream_id)
+                            })
+                            .unwrap();
+
+                        match &mut entry
+                            .1
+                            .connect_reqs
+                            .first_mut()
+                            .unwrap()
+                            .response_writer
+                        {
+                            Some(rw) => {
+                                rw.write_all(&buf[..read]).ok();
+                            },
+
+                            None => {
+                                print!("{}", unsafe {
+                                    std::str::from_utf8_unchecked(&buf[..read])
+                                });
+                            },
+                        }
+                    }
+                },
+
+                Ok((_stream_id, quiche::h3::Event::Finished)) => {
+                    // TODO: properly detect end of connect and tunneled requests.
+
+                    /*self.reqs_complete += 1;
+                    let reqs_count = self.connect_reqs.len();
+
+                    debug!(
+                        "{}/{} responses received",
+                        self.reqs_complete, reqs_count
+                    );
+
+                    if self.reqs_complete == reqs_count {
+                        info!(
+                            "{}/{} response(s) received in {:?}, closing...",
+                            self.reqs_complete,
+                            reqs_count,
+                            req_start.elapsed()
+                        );
+
+                        match conn.close(true, 0x00, b"kthxbye") {
+                            // Already closed.
+                            Ok(_) | Err(quiche::Error::Done) => (),
+
+                            Err(e) => panic!("error closing conn: {:?}", e),
+                        }
+
+                        break;
+                    }*/
+                },
+
+                Ok((_flow_id, quiche::h3::Event::Datagram)) => {
+                    let (len, flow_id, flow_id_len) =
+                        self.h3_conn.recv_dgram(conn, buf).unwrap();
+
+                    info!(
+                        "Received DATAGRAM flow_id={} len={} data={:?}",
+                        flow_id,
+                        len,
+                        buf[flow_id_len..len].to_vec()
+                    );
+                },
+
+                Ok((_id, quiche::h3::Event::GoAway)) => (),
+
+                Err(quiche::h3::Error::Done) => {
+                    break;
+                },
+
+                Err(e) => {
+                    error!("HTTP/3 processing failed: {:?}", e);
+
+                    break;
+                },
+            }
+        }
+    }
+
+    fn report_incomplete(&self, start: &std::time::Instant) -> bool {
+        // TODO: properly detect end of connect and tunneled requests.
+
+        if self.reqs_complete == 0 {
+            error!(
+                "connection timed out after {:?} and completed 0 requests",
+                start.elapsed(),
+            );
+
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_requests(
+        &mut self, conn: &mut std::pin::Pin<Box<quiche::Connection>>,
+        partial_requests: &mut HashMap<u64, PartialRequest>,
+        partial_responses: &mut HashMap<u64, PartialResponse>, _root: &str,
+        _index: &str, buf: &mut [u8],
+    ) -> quiche::h3::Result<()> {
+        // Process HTTP events.
+        loop {
+            // check partial requests, flush as much pending data to socket as
+            // possible
+            for (stream_id, partial) in partial_requests.iter_mut() {
+                trace!("There are {} bytes to send to target", partial.req.len());
+                if partial.req.is_empty() {
+                    continue;
+                }
+
+                if let Some(upstream) = self.upstreams.get_mut(stream_id) {
+                    if let Some(tcp) = &mut upstream.tcp_stream {
+                        match tcp.write(partial.req.as_slice()) {
+                            Ok(written) => {
+                                trace!("{} bytes sent to target", written);
+
+                                partial.req.drain(..written);
+                            },
+
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::WouldBlock {
+                                    trace!("write() would block");
+                                    // break;
+                                    continue;
+                                }
+
+                                panic!("read() failed: {:?}", e);
+                            },
+                        }
+                    }
+                }
+            }
+
+            for (stream_id, upstream) in self.upstreams.iter_mut() {
+                if let Some(tcp) = &mut upstream.tcp_stream {
+                    match tcp.read(buf) {
+                        Ok(0) => {
+                            error!("Connection for stream {} closed, TODO reset stream", stream_id);
+                        },
+                        Ok(len) => {
+                            trace!(
+                                "read {} bytes from target of stream {}: {:?}",
+                                len,
+                                stream_id,
+                                buf[..len].to_vec()
+                            );
+
+                            let resp =
+                                partial_responses.get_mut(&stream_id).unwrap();
+                            resp.body.extend_from_slice(&buf[..len]);
+                        },
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                trace!("recv() would block");
+                                continue;
+                            }
+
+                            panic!("read() failed: {:?}", e);
+                        },
+                    }
+                }
+            }
+
+            match self.h3_conn.poll(conn) {
+                Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                    info!(
+                        "{} got request {:?} on stream id {}",
+                        conn.trace_id(),
+                        &list,
+                        stream_id
+                    );
+
+                    let proxy_type = MasqueConn::validate_tunnel_request(&list)?;
+
+                    // make the upstream connection
+                    match proxy_type {
+                        ProxyType::Http(ref host) => {
+                            let address =
+                                host.to_socket_addrs().unwrap().next().unwrap();
+
+                            let tcp_stream =
+                                mio::net::TcpStream::connect(&address).unwrap();
+
+                            let poll = mio::Poll::new().unwrap();
+                            let mut events = mio::Events::with_capacity(1024);
+                            poll.register(
+                                &tcp_stream,
+                                mio::Token(0),
+                                mio::Ready::writable(),
+                                mio::PollOpt::edge(),
+                            )
+                            .unwrap();
+
+                            poll.poll(
+                                &mut events,
+                                Some(std::time::Duration::from_millis(100)),
+                            )
+                            .unwrap();
+
+                            self.upstreams.insert(stream_id, Upstream {
+                                poll,
+                                events,
+                                udp_socket: None,
+                                tcp_stream: Some(tcp_stream),
+                            });
+                        },
+
+                        ProxyType::Udp(_) => {
+                            // TODO
+                        },
+
+                        ProxyType::Quic(_) => {
+                            // TODO
+                        },
+
+                        _ => (),
+                    }
+
+                    trace!("Upstream={:?}", self.upstreams);
+
+                    let (headers, fin) = match proxy_type {
+                        ProxyType::Http(_) |
+                        ProxyType::Udp(_) |
+                        ProxyType::Quic(_) => (
+                            vec![
+                                quiche::h3::Header::new(
+                                    ":status",
+                                    &200.to_string(),
+                                ),
+                                quiche::h3::Header::new(
+                                    "server",
+                                    "quiche-masque",
+                                ),
+                            ],
+                            false,
+                        ),
+
+                        _ => (
+                            vec![
+                                quiche::h3::Header::new(
+                                    ":status",
+                                    &505.to_string(),
+                                ),
+                                quiche::h3::Header::new(
+                                    "server",
+                                    "quiche-masque",
+                                ),
+                            ],
+                            true,
+                        ),
+                    };
+
+                    let response = PartialResponse {
+                        headers: Some(headers),
+                        body: Vec::new(),
+                        written: 0,
+                        fin,
+                    };
+
+                    partial_responses.insert(stream_id, response);
+                },
+
+                Ok((stream_id, quiche::h3::Event::Data)) => {
+                    info!(
+                        "{} got data on stream id {}",
+                        conn.trace_id(),
+                        stream_id
+                    );
+
+                    if let Ok(read) = self.h3_conn.recv_body(conn, stream_id, buf)
+                    {
+                        debug!(
+                            "got {} bytes of inner tunnel data on stream {}",
+                            read, stream_id
+                        );
+
+                        error!(
+                            "got in inner tunnel was {:?}",
+                            buf[..read].to_vec()
+                        );
+
+                        if let Some(partial) =
+                            partial_requests.get_mut(&stream_id)
+                        {
+                            partial.req.extend_from_slice(&buf[..read]);
+                        } else {
+                            let request = PartialRequest {
+                                req: buf[..read].to_vec(),
+                            };
+
+                            error!("len req = {}", request.req.len());
+
+                            partial_requests.insert(stream_id, request);
+                        }
+                    }
+                },
+
+                Ok((_stream_id, quiche::h3::Event::Finished)) => (),
+
+                Ok((_, quiche::h3::Event::Datagram)) => {
+                    let (len, flow_id, flow_id_len) =
+                        self.h3_conn.recv_dgram(conn, buf).unwrap();
+
+                    info!(
+                        "Received DATAGRAM flow_id={} data={:?}",
+                        flow_id,
+                        &buf[flow_id_len..len].to_vec()
+                    );
+                },
+
+                Ok((_id, quiche::h3::Event::GoAway)) => (),
+
+                Err(quiche::h3::Error::Done) => {
+                    break;
+                },
+
+                Err(e) => {
+                    error!("{} HTTP/3 error {:?}", conn.trace_id(), e);
+
+                    return Err(e);
+                },
+            }
+        }
+
+        if let Some(ds) = self.dgram_sender.as_mut() {
+            let mut dgrams_done = 0;
+
+            for _ in ds.dgrams_sent..ds.dgram_count {
+                info!(
+                    "sending HTTP/3 DATAGRAM on flow_id={} with data {:?}",
+                    ds.flow_id,
+                    ds.dgram_content.as_bytes()
+                );
+
+                match self.h3_conn.send_dgram(
+                    conn,
+                    0,
+                    ds.dgram_content.as_bytes(),
+                ) {
+                    Ok(v) => v,
+
+                    Err(e) => {
+                        error!("failed to send dgram {:?}", e);
+                        break;
+                    },
+                }
+
+                dgrams_done += 1;
+            }
+
+            ds.dgrams_sent += dgrams_done;
+        }
+
+        Ok(())
+    }
+
+    fn handle_writable(
+        &mut self, conn: &mut std::pin::Pin<Box<quiche::Connection>>,
+        partial_responses: &mut HashMap<u64, PartialResponse>, stream_id: u64,
+    ) {
+        trace!("{} stream {} is writable", conn.trace_id(), stream_id);
+
+        if !partial_responses.contains_key(&stream_id) {
+            return;
+        }
+
+        let resp = partial_responses.get_mut(&stream_id).unwrap();
+
+        if let Some(ref headers) = resp.headers {
+            trace!("writing CONNECT response headers");
+            match self.h3_conn.send_response(conn, stream_id, &headers, false) {
+                Ok(_) => (),
+
+                Err(quiche::h3::Error::StreamBlocked) => {
+                    return;
+                },
+
+                Err(e) => {
+                    error!("{} stream send failed {:?}", conn.trace_id(), e);
+                    return;
+                },
+            }
+        }
+
+        resp.headers = None;
+
+        // Once the CONNECT response has been sent, we move on to sending payload
+        // received from the target as body data.
+        if resp.body.len() != 0 {
+            trace!(
+                "ready to send {} bytes to stream {}",
+                resp.body.len(),
+                stream_id
+            );
+
+            let written = match self
+                .h3_conn
+                .send_body(conn, stream_id, &resp.body, false)
+            {
+                Ok(v) => v,
+
+                Err(quiche::h3::Error::Done) => {
+                    return;
+                },
+
+                Err(e) => {
+                    error!("{} stream send failed {:?}", conn.trace_id(), e);
+                    return;
+                },
+            };
+
+            resp.body.drain(..written);
+        }
+
+        // TODO make an upstream bufer or write to partial directly?
+        let mut buf = [0; 10240];
+
+        if let Some(upstream) = self.upstreams.get_mut(&stream_id) {
+            let timeout = Some(std::time::Duration::from_millis(100));
+            upstream.poll.poll(&mut upstream.events, timeout).unwrap();
+
+            if upstream.events.is_empty() {
+                // Nothing happened to our TCP socket so just exit now.
+                return;
+            }
+
+            if let Some(tcp) = &mut upstream.tcp_stream {
+                trace!("Reading from target TCP socket");
+                match tcp.read(&mut buf) {
+                    Ok(0) => {
+                        // TODO: if the upstream closes connection, we should
+                        // reset the stream.
+                        error!("Target connection closed, deal with it!");
+                    },
+
+                    Ok(len) => {
+                        trace!(
+                            "Read {} bytes from target server: {:?}",
+                            len,
+                            buf[..len].to_vec()
+                        );
+
+                        let resp = partial_responses.get_mut(&stream_id).unwrap();
+                        resp.body.extend_from_slice(&buf[..len]);
+                    },
+
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            error!("Target server read() would block");
+                            return;
+                        }
+
+                        panic!("read() failed: {:?}", e);
+                    },
+                }
+            }
         }
     }
 }

@@ -87,8 +87,18 @@ fn main() {
     let poll = mio::Poll::new().unwrap();
     let mut events = mio::Events::with_capacity(1024);
 
-    // We'll only connect to the first server provided in URL list.
-    let connect_url = &args.urls[0];
+    // Detect proxy settings
+    let proxy_type = get_proxy_type();
+
+    let connect_url = match proxy_type {
+        ProxyType::Http(ref v) => url::Url::parse(v).unwrap(),
+
+        ProxyType::Udp(ref v) => url::Url::parse(v).unwrap(),
+
+        ProxyType::Quic(ref v) => url::Url::parse(v).unwrap(),
+
+        ProxyType::Direct => args.urls[0].clone(),
+    };
 
     // Resolve server address.
     let peer_addr = if let Some(addr) = &args.connect_to {
@@ -324,7 +334,20 @@ fn main() {
             let app_proto = conn.application_proto();
             let app_proto = &std::str::from_utf8(&app_proto).unwrap();
 
-            if alpns::HTTP_09.contains(app_proto) {
+            let proxy_type = get_proxy_type();
+            if let ProxyType::Http(_) = proxy_type {
+                http_conn = Some(MasqueConn::with_urls(
+                    &mut conn,
+                    &args.urls,
+                    args.reqs_cardinal,
+                    &args.req_headers,
+                    &args.body,
+                    &args.method,
+                    None,
+                    proxy_type,
+                ));
+                app_proto_selected = true;
+            } else if alpns::HTTP_09.contains(app_proto) {
                 http_conn =
                     Some(Http09Conn::with_urls(&args.urls, args.reqs_cardinal));
 

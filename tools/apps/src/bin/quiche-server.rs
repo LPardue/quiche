@@ -63,6 +63,7 @@ Options:
   --dgram-proto PROTO         DATAGRAM application protocol to use [default: none].
   --dgram-count COUNT         Number of DATAGRAMs to send [default: 0].
   --dgram-data DATA           Data to send for certain types of DATAGRAM application protocol [default: brrr].
+  --masque                    Enable MASQUE proxy mode.
   --cc-algorithm NAME         Specify which congestion control algorithm to use [default: cubic].
   --disable-hystart           Disable HyStart++.
   -h --help                   Show this screen.
@@ -161,11 +162,55 @@ fn main() {
     let mut pkt_count = 0;
 
     loop {
+        // Handle MASQUE
+        if args.masque {
+            for (_peer, client) in clients.values_mut() {
+                if let Some(http_conn) = &mut client.http_conn {
+                    // Start with any pending inbound requests. Once the CONNECT
+                    // is handled, this should just be
+                    // tunneled data as request body.
+                    let conn = &mut client.conn;
+                    let partial_responses = &mut client.partial_responses;
+
+                    if http_conn
+                        .handle_requests(
+                            conn,
+                            &mut client.partial_requests,
+                            partial_responses,
+                            &args.root,
+                            &args.index,
+                            &mut buf,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    // Now check the inbound data from the target server.
+                    for stream_id in conn.writable() {
+                        http_conn.handle_writable(
+                            conn,
+                            partial_responses,
+                            stream_id,
+                        );
+                    }
+                }
+            }
+        }
+
+        // TODO: MASQUE really messes up this nice old logic! We don't want to
+        // block too long on either front or back reads. Need a better solution.
+        //
         // Find the shorter timeout from all the active connections.
         //
-        // TODO: use event loop that properly supports timers
-        let timeout =
-            clients.values().filter_map(|(_, c)| c.conn.timeout()).min();
+        // TODO: use event loop that properly supports timers let timeout =
+        // clients.values().filter_map(|(_, c)| c.conn.timeout()).min();
+
+        let timeout = if args.masque {
+            Some(std::time::Duration::from_millis(100))
+        } else {
+            clients.values().filter_map(|(_, c)| c.conn.timeout()).min()
+        };
 
         poll.poll(&mut events, timeout).unwrap();
 
@@ -176,7 +221,7 @@ fn main() {
             // has expired, so handle it without attempting to read packets. We
             // will then proceed with the send loop.
             if events.is_empty() {
-                trace!("timed out");
+                // trace!("timed out");
 
                 clients.values_mut().for_each(|(_, c)| c.conn.on_timeout());
 
@@ -402,20 +447,25 @@ fn main() {
 
                     client.app_proto_selected = true;
                 } else if alpns::HTTP_3.contains(app_proto) {
-                    let dgram_sender = if conn_args.dgrams_enabled {
-                        Some(Http3DgramSender::new(
-                            conn_args.dgram_count,
-                            conn_args.dgram_data.clone(),
-                            1,
-                        ))
+                    if args.masque {
+                        client.http_conn =
+                            Some(MasqueConn::with_conn(&mut client.conn, None));
                     } else {
-                        None
-                    };
+                        let dgram_sender = if conn_args.dgrams_enabled {
+                            Some(Http3DgramSender::new(
+                                conn_args.dgram_count,
+                                conn_args.dgram_data.clone(),
+                                1,
+                            ))
+                        } else {
+                            None
+                        };
 
-                    client.http_conn = Some(Http3Conn::with_conn(
-                        &mut client.conn,
-                        dgram_sender,
-                    ));
+                        client.http_conn = Some(Http3Conn::with_conn(
+                            &mut client.conn,
+                            dgram_sender,
+                        ));
+                    }
 
                     client.app_proto_selected = true;
                 } else if alpns::SIDUCK.contains(app_proto) {
@@ -583,6 +633,7 @@ struct ServerArgs {
     cert: String,
     key: String,
     early_data: bool,
+    masque: bool,
 }
 
 impl Args for ServerArgs {
@@ -596,6 +647,7 @@ impl Args for ServerArgs {
         let index = args.get_str("--index").to_string();
         let cert = args.get_str("--cert").to_string();
         let key = args.get_str("--key").to_string();
+        let masque = args.get_bool("--masque");
 
         ServerArgs {
             listen,
@@ -605,6 +657,7 @@ impl Args for ServerArgs {
             cert,
             key,
             early_data,
+            masque,
         }
     }
 }
