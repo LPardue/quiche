@@ -353,6 +353,7 @@ fn main() {
                     partial_requests: HashMap::new(),
                     partial_responses: HashMap::new(),
                     siduck_conn: None,
+                    webtrans_conn: None,
                     app_proto_selected: false,
                 };
 
@@ -423,6 +424,10 @@ fn main() {
                     ));
 
                     client.app_proto_selected = true;
+                } else if alpns::QUICTRANSPORT.contains(app_proto) {
+                    client.webtrans_conn = Some(WebTransConn::new());
+
+                    client.app_proto_selected = true;
                 }
             }
 
@@ -457,6 +462,20 @@ fn main() {
                 let si_conn = client.siduck_conn.as_mut().unwrap();
 
                 if si_conn.handle_quacks(conn, &mut buf).is_err() {
+                    continue 'read;
+                }
+            }
+
+            // If we have a QuicTransport connection, handle the data.
+            if client.webtrans_conn.is_some() {
+                let conn = &mut client.conn;
+                let webtrans_conn = client.webtrans_conn.as_mut().unwrap();
+
+                if webtrans_conn.handle_dgrams(conn, &mut buf).is_err() {
+                    continue 'read;
+                }
+
+                if webtrans_conn.handle_requests(conn, &mut buf).is_err() {
                     continue 'read;
                 }
             }

@@ -159,6 +159,7 @@ fn main() {
 
     let mut http_conn: Option<Box<dyn HttpConn>> = None;
     let mut siduck_conn: Option<SiDuckConn> = None;
+    let mut webtrans_conn: Option<WebTransConn> = None;
 
     let mut app_proto_selected = false;
 
@@ -338,6 +339,14 @@ fn main() {
                 ));
 
                 app_proto_selected = true;
+            } else if alpns::QUICTRANSPORT.contains(app_proto) {
+                webtrans_conn = Some(WebTransConn::with_url(
+                    args.urls[0].clone(),
+                    conn_args.dgram_count,
+                    conn_args.dgram_data.clone(),
+                ));
+
+                app_proto_selected = true;
             }
         }
 
@@ -353,6 +362,20 @@ fn main() {
         if let Some(si_conn) = siduck_conn.as_mut() {
             si_conn.send_quacks(&mut conn);
             si_conn.handle_quack_acks(&mut conn, &mut buf, &app_data_start);
+        }
+
+        // If we have a webtransport connection, first issue stuff then process
+        // receeived data.
+        if let Some(webtrans_conn) = webtrans_conn.as_mut() {
+            webtrans_conn.send_client_indication(&mut conn);
+            webtrans_conn.send_datagrams(&mut conn);
+            webtrans_conn.send_honks(&mut conn);
+            webtrans_conn.handle_dgram_echoes(
+                &mut conn,
+                &mut buf,
+                &app_data_start,
+            );
+            webtrans_conn.handle_responses(&mut conn, &mut buf, &app_data_start);
         }
 
         // Generate outgoing QUIC packets and send them on the UDP socket, until

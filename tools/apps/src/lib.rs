@@ -35,7 +35,9 @@ extern crate log;
 use std::io::prelude::*;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
+use std::convert::TryFrom;
 use std::net;
 use std::path;
 
@@ -57,6 +59,7 @@ pub mod alpns {
     pub const HTTP_09: [&str; 4] = ["hq-29", "hq-28", "hq-27", "http/0.9"];
     pub const HTTP_3: [&str; 3] = ["h3-29", "h3-28", "h3-27"];
     pub const SIDUCK: [&str; 2] = ["siduck", "siduck-00"];
+    pub const QUICTRANSPORT: [&str; 1] = ["wq-vvv-01"];
 
     pub fn length_prefixed(alpns: &[&str]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -138,6 +141,10 @@ impl Args for CommonArgs {
             // SiDuck is it's own application protocol.
             (_, "siduck") => (alpns::length_prefixed(&alpns::SIDUCK), true),
 
+            // WebTransport QuicTransport is it's own application protocol.
+            (_, "wq-vvv") =>
+                (alpns::length_prefixed(&alpns::QUICTRANSPORT), true),
+
             (..) => panic!("Unsupported HTTP version and DATAGRAM protocol."),
         };
 
@@ -206,6 +213,8 @@ pub struct Client {
 
     pub siduck_conn: Option<SiDuckConn>,
 
+    pub webtrans_conn: Option<WebTransConn>,
+
     pub app_proto_selected: bool,
 
     pub partial_requests: std::collections::HashMap<u64, PartialRequest>,
@@ -214,6 +223,8 @@ pub struct Client {
 }
 
 pub type ClientMap = HashMap<Vec<u8>, (net::SocketAddr, Client)>;
+
+type WebTransportStreamMap = HashMap<u64, Vec<u8>>;
 
 /// Makes a buffered writer for a resource with a target URL.
 ///
@@ -356,7 +367,426 @@ pub trait HttpConn {
         partial_responses: &mut HashMap<u64, PartialResponse>, stream_id: u64,
     );
 }
+pub struct WebTransConn {
+    url: Option<url::Url>,
+    honks_to_send: u64,
+    honks_echoed: u64,
+    honks_sent: bool,
+    honks_completed: bool,
+    dgrams_to_send: u64,
+    dgram_contents: String,
+    dgrams_sent: u64,
+    dgrams_acked: u64,
+    qt_streams: WebTransportStreamMap,
+    qt_streams_complete: HashSet<u64>,
+    next_uni_stream_id: u64,
+    client_indication_ok: bool,
+}
 
+impl WebTransConn {
+    pub fn with_url(
+        url: url::Url, dgrams_to_send: u64, dgram_contents: String,
+    ) -> Self {
+        WebTransConn {
+            url: Some(url),
+            honks_to_send: 2,
+            honks_echoed: 0,
+            honks_sent: false,
+            honks_completed: false,
+            dgrams_to_send,
+            dgram_contents,
+            dgrams_sent: 0,
+            dgrams_acked: 0,
+            qt_streams: WebTransportStreamMap::new(),
+            qt_streams_complete: HashSet::new(),
+            next_uni_stream_id: 3,
+            client_indication_ok: false,
+        }
+    }
+
+    pub fn new() -> Self {
+        WebTransConn {
+            url: None,
+            honks_to_send: 0,
+            honks_echoed: 0,
+            honks_sent: false,
+            honks_completed: false,
+            dgrams_to_send: 0,
+            dgram_contents: "".to_string(),
+            dgrams_sent: 0,
+            dgrams_acked: 0,
+            qt_streams: WebTransportStreamMap::new(),
+            qt_streams_complete: HashSet::new(),
+            next_uni_stream_id: 3,
+            client_indication_ok: false,
+        }
+    }
+
+    pub fn send_client_indication(&mut self, conn: &mut quiche::Connection) {
+        if self.client_indication_ok {
+            return;
+        }
+
+        let url = self.url.as_ref().unwrap();
+        let mut path = String::from(url.path());
+
+        if let Some(query) = url.query() {
+            path.push('?');
+            path.push_str(query);
+        }
+
+        let mut d: Vec<u8> = Vec::new();
+
+        // Origin Field
+        let field_id: u16 = 0;
+        d.extend_from_slice(&field_id.to_be_bytes());
+
+        let origin = &url[..url::Position::BeforePath];
+        d.extend_from_slice(&(origin.len() as u16).to_be_bytes());
+        d.extend_from_slice(origin.as_bytes());
+
+        // Path Field
+        let field_id: u16 = 1;
+        d.extend_from_slice(&field_id.to_be_bytes());
+        let path = &url[url::Position::BeforePath..];
+        d.extend_from_slice(&(path.len() as u16).to_be_bytes());
+        d.extend_from_slice(path.as_bytes());
+
+        trace!("sending client indication {:?}...", d);
+
+        conn.stream_send(2, &d, true).ok();
+        self.client_indication_ok = true;
+    }
+
+    pub fn send_datagrams(&mut self, conn: &mut quiche::Connection) {
+        trace!("sending quacks");
+        let mut dgrams_done = 0;
+
+        for _ in self.dgrams_sent..self.dgrams_to_send {
+            info!("sending QUIC DATAGRAM with data {:?}", self.dgram_contents);
+
+            match conn.dgram_send(self.dgram_contents.as_bytes()) {
+                Ok(v) => v,
+
+                Err(e) => {
+                    error!("failed to send dgram {:?}", e);
+
+                    break;
+                },
+            }
+
+            dgrams_done += 1;
+        }
+
+        self.dgrams_sent += dgrams_done;
+    }
+
+    // server-side
+    pub fn handle_dgrams(
+        &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
+    ) -> quiche::h3::Result<()> {
+        loop {
+            match conn.dgram_recv(buf) {
+                Ok(len) => {
+                    let data =
+                        unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
+                    info!("Received DATAGRAM data {:?}", data);
+
+                    // TODO
+                    match conn.dgram_send(format!("{}", len).as_bytes()) {
+                        Ok(v) => v,
+
+                        Err(quiche::Error::Done) => (),
+
+                        Err(e) => {
+                            error!("failed to send dgram bytes back {:?}", e);
+                            return Err(From::from(e));
+                        },
+                    }
+                },
+
+                Err(quiche::Error::Done) => break,
+
+                Err(e) => {
+                    error!("failure receiving DATAGRAM failure {:?}", e);
+
+                    return Err(From::from(e));
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    // client-side
+    pub fn handle_dgram_echoes(
+        &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
+        start: &std::time::Instant,
+    ) {
+        trace!("handle_dgram_echoes");
+
+        loop {
+            match conn.dgram_recv(buf) {
+                Ok(len) => {
+                    let data =
+                        unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
+
+                    info!("Received DATAGRAM data {:?}", data);
+                    self.dgrams_acked += 1;
+
+                    debug!(
+                        "{}/{} dgrams acked",
+                        self.dgrams_acked, self.dgrams_to_send
+                    );
+
+                    if self.dgrams_acked == self.dgrams_to_send {
+                        info!(
+                            "{}/{} dgrams(s) received in {:?}",
+                            self.dgrams_acked,
+                            self.dgrams_to_send,
+                            start.elapsed()
+                        );
+
+                        if self.dgrams_acked == self.dgrams_to_send &&
+                            self.honks_echoed == self.honks_to_send
+                        {
+                            info!("All sent data was echoed! Closing ...");
+                            match conn.close(true, 0x00, b"kthxbye") {
+                                // Already closed.
+                                Ok(_) | Err(quiche::Error::Done) => (),
+
+                                Err(e) => panic!("error closing conn: {:?}", e),
+                            }
+                        }
+
+                        break;
+                    }
+                },
+
+                Err(quiche::Error::Done) => {
+                    break;
+                },
+
+                Err(e) => {
+                    error!("failure receiving DATAGRAM failure {:?}", e);
+
+                    break;
+                },
+            }
+        }
+    }
+
+    pub fn send_honks(&mut self, conn: &mut quiche::Connection) {
+        if self.honks_sent {
+            return;
+        }
+
+        debug!("Sending honks on stream 0 and 6");
+        conn.stream_send(0, b"HONK", true).unwrap();
+        conn.stream_send(6, b"HONK", true).unwrap();
+
+        self.honks_sent = true;
+    }
+
+    pub fn report_incomplete(&self, start: &std::time::Instant) {
+        if self.dgrams_acked != self.dgrams_to_send {
+            error!(
+                "connection timed out after {:?} and only received {}/{} echoes",
+                start.elapsed(),
+                self.dgrams_acked,
+                self.dgrams_to_send
+            );
+        }
+    }
+
+    // server-side
+    pub fn handle_requests(
+        &mut self, conn: &mut std::pin::Pin<Box<quiche::Connection>>,
+        buf: &mut [u8],
+    ) -> quiche::h3::Result<()> {
+        // Process all readable streams.
+        for s in conn.readable() {
+            while let Ok((read, fin)) = conn.stream_recv(s, buf) {
+                trace!("{} received {} bytes", conn.trace_id(), read);
+
+                if self.qt_streams_complete.contains(&s) {
+                    return Ok(());
+                }
+
+                let qt_stream_data =
+                    self.qt_streams.entry(s).or_insert(Vec::new());
+
+                trace!(
+                    "{} stream {} has {} bytes (fin? {})",
+                    conn.trace_id(),
+                    s,
+                    qt_stream_data.len(),
+                    fin
+                );
+
+                qt_stream_data.extend_from_slice(&buf[..read]);
+
+                trace!(
+                    "{} steam {} now has {} bytes total",
+                    conn.trace_id(),
+                    s,
+                    qt_stream_data.len()
+                );
+
+                if fin {
+                    if s == 2 {
+                        self.client_indication_ok =
+                            Self::process_client_indication(qt_stream_data);
+
+                        if !self.client_indication_ok {
+                            error!(
+                                "{} QuicTransport client indication failure",
+                                conn.trace_id()
+                            );
+
+                            conn.close(
+                                false,
+                                0x1,
+                                b"QuicTransport client indication fail",
+                            )
+                            .ok();
+                        }
+                    } else if self.client_indication_ok {
+                        let stream_id = if s % 4 == 0 {
+                            s
+                        } else {
+                            let ret = self.next_uni_stream_id;
+                            self.next_uni_stream_id += 4;
+                            ret
+                        };
+
+                        let len = qt_stream_data.len().to_string();
+
+                        trace!(
+                            "about to reply on stream {} with {:?}",
+                            stream_id,
+                            len
+                        );
+
+                        conn.stream_send(stream_id, len.as_bytes(), true)
+                            .unwrap();
+
+                        self.qt_streams_complete.insert(s);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn handle_responses(
+        &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
+        start: &std::time::Instant,
+    ) {
+        for s in conn.readable() {
+            while let Ok((read, fin)) = conn.stream_recv(s, buf) {
+                debug!("{} received {} bytes", conn.trace_id(), read);
+
+                let stream_buf = &buf[..read];
+
+                debug!(
+                    "stream {} has {} bytes (fin? {})",
+                    s,
+                    stream_buf.len(),
+                    fin
+                );
+
+                // TODO: store all received data and only check when fin'd
+                unsafe {
+                    let echoed_len: usize =
+                        std::str::from_utf8_unchecked(&stream_buf)
+                            .parse()
+                            .unwrap();
+
+                    if echoed_len == b"HONK".len() {
+                        self.honks_echoed += 1;
+
+                        if self.honks_echoed == self.honks_to_send {
+                            info!(
+                                "{}/{} honks(s) received in {:?}",
+                                self.honks_echoed,
+                                self.honks_to_send,
+                                start.elapsed()
+                            );
+                            self.honks_completed = true;
+                        }
+                    }
+
+                    if self.dgrams_acked == self.dgrams_to_send &&
+                        self.honks_echoed == self.honks_to_send
+                    {
+                        info!("All sent data was echoed! Closing ...");
+                        match conn.close(true, 0x00, b"kthxbye") {
+                            // Already closed.
+                            Ok(_) | Err(quiche::Error::Done) => (),
+
+                            Err(e) => panic!("error closing conn: {:?}", e),
+                        }
+                    }
+                };
+
+                // if fin {
+                // info!("stream {} closed", s);
+                // }
+            }
+        }
+    }
+
+    fn process_client_indication(buf: &[u8]) -> bool {
+        let mut offset = 0;
+
+        // origin
+        let tmp = <[u8; 2]>::try_from(&buf[offset..offset + 2]).unwrap();
+        let field = u16::from_be_bytes(tmp);
+        if field != 0 {
+            trace!("field key != 0");
+            return false;
+        }
+
+        offset += 2;
+
+        let tmp = <[u8; 2]>::try_from(&buf[offset..offset + 2]).unwrap();
+        let origin_len = u16::from_be_bytes(tmp);
+        trace!("origin_len={}", origin_len);
+        offset += 2;
+
+        let origin =
+            std::str::from_utf8(&buf[offset..offset + origin_len as usize])
+                .unwrap();
+
+        offset += origin_len as usize;
+
+        // path
+        let tmp = <[u8; 2]>::try_from(&buf[offset..offset + 2]).unwrap();
+        let field = u16::from_be_bytes(tmp);
+        if field != 1 {
+            error!("field key != 1");
+            return false;
+        }
+
+        offset += 2;
+
+        let tmp = <[u8; 2]>::try_from(&buf[offset..offset + 2]).unwrap();
+        let path_len = u16::from_be_bytes(tmp);
+
+        offset += 2;
+
+        let path = std::str::from_utf8(&buf[offset..offset + path_len as usize])
+            .unwrap();
+
+        // TODO: validate origin
+        // let url1 = url::Url::parse(origin);
+        // let url2 = url::Url::parse(path);
+
+        true
+    }
+}
 pub struct SiDuckConn {
     quacks_to_make: u64,
     quack_contents: String,
