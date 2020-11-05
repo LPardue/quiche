@@ -1608,15 +1608,16 @@ impl HttpConn for Http3Conn {
 struct Upstream {
     poll: mio::Poll,
     events: mio::Events,
-    udp_socket: Option<std::net::UdpSocket>,
+    udp_socket: Option<mio::net::UdpSocket>,
     tcp_stream: Option<mio::tcp::TcpStream>,
 }
 
 #[derive(Debug)]
 struct ConnectContext {
-    connect_reqs: Vec<Http3Request>,
+    connect_reqs: Vec<Http3Request>, // vector but only need one?
     inner_h11_reqs: Option<Vec<Http11Request>>,
     _inner_h3_reqs: Option<Vec<Http3Request>>,
+    flow_id: Option<u64>,
 }
 
 type ContextMap = HashMap<String, ConnectContext>;
@@ -1629,13 +1630,14 @@ pub struct MasqueConn {
     _body: Option<Vec<u8>>,
     dgram_sender: Option<Http3DgramSender>,
     upstreams: HashMap<u64, Upstream>,
+    closed_upstreams: Vec<u64>,
 }
 
 impl MasqueConn {
     pub fn with_urls(
         conn: &mut quiche::Connection, urls: &[url::Url], reqs_cardinal: u64,
         req_headers: &[String], body: &Option<Vec<u8>>, method: &str,
-        dgram_sender: Option<Http3DgramSender>, proxy_type: ProxyType,
+        dgram_sender: Option<Http3DgramSender>, proxy_type: &ProxyType,
     ) -> Box<dyn HttpConn> {
         // todo rustify this
         let body_len = match body {
@@ -1644,6 +1646,8 @@ impl MasqueConn {
         };
 
         let mut client_view = ContextMap::new();
+
+        let mut flow_id = 0;
 
         // From the given set of URLs:
         // 1) find the unique target server, there will be one CONNECT to this
@@ -1657,6 +1661,7 @@ impl MasqueConn {
             );
 
             match client_view.get_mut(&authority) {
+                // Append
                 Some(v) => match proxy_type {
                     ProxyType::Http(_) => {
                         let mut reqs = Http11Request::generate(
@@ -1680,21 +1685,37 @@ impl MasqueConn {
                     _ => (),
                 },
 
+                // Populate first entry
                 None => {
-                    let (conn_method, inner_h11_reqs, inner_h3_reqs) =
-                        match proxy_type {
-                            ProxyType::Http(_) => (
-                                "CONNECT",
-                                Some(Http11Request::generate(
-                                    &[url.clone()],
-                                    reqs_cardinal,
-                                )),
-                                None,
-                            ),
+                    let (
+                        conn_method,
+                        inner_h11_reqs,
+                        inner_h3_reqs,
+                        flow_id,
+                        connect_headers,
+                    ) = match proxy_type {
+                        ProxyType::Http(_) => (
+                            "CONNECT",
+                            Some(Http11Request::generate(
+                                &[url.clone()],
+                                reqs_cardinal,
+                            )),
+                            None,
+                            None,
+                            req_headers.to_vec(),
+                        ),
 
-                            // TODO: the CONNECT-UDP methods need some extra
-                            // headers. Figure out how to handle this.
-                            ProxyType::Udp(_) => (
+                        ProxyType::Udp(_) => {
+                            let current_flow_id = flow_id;
+                            flow_id += 4;
+
+                            let mut connect_headers = req_headers.to_vec();
+                            connect_headers.push(format!(
+                                "datagram-flow-id: {}",
+                                current_flow_id
+                            ));
+
+                            (
                                 "CONNECT-UDP",
                                 None,
                                 Some(Http3Request::generate(
@@ -1704,34 +1725,49 @@ impl MasqueConn {
                                     req_headers,
                                     body_len,
                                 )),
-                            ),
+                                Some(current_flow_id),
+                                connect_headers,
+                            )
+                        },
 
-                            ProxyType::Quic(_) => ("CONNECT-UDP", None, None),
+                        // TODO: this CONNECT-UDP methods need some extra
+                        // headers. Figure out how to handle this.
+                        ProxyType::Quic(_) => (
+                            "CONNECT-UDP",
+                            None,
+                            None,
+                            None,
+                            req_headers.to_vec(),
+                        ),
 
-                            _ => (method, None, None),
-                        };
+                        _ => (method, None, None, None, req_headers.to_vec()),
+                    };
+
                     let cc = ConnectContext {
                         connect_reqs: Http3Request::generate(
                             &[url.clone()],
                             1,
                             conn_method,
-                            req_headers,
+                            &connect_headers,
                             None,
                         ),
                         inner_h11_reqs,
                         _inner_h3_reqs: inner_h3_reqs,
+                        flow_id,
                     };
                     client_view.insert(authority, cc);
                 },
             }
         }
 
+        trace!("client view is {:?}", client_view);
+        let mut config = quiche::h3::Config::new().unwrap();
+        config.set_dgram_poll_threshold(1);
+        config.set_stream_poll_threshold(1);
+
         let h_conn = MasqueConn {
-            h3_conn: quiche::h3::Connection::with_transport(
-                conn,
-                &quiche::h3::Config::new().unwrap(),
-            )
-            .unwrap(),
+            h3_conn: quiche::h3::Connection::with_transport(conn, &config)
+                .unwrap(),
             reqs_sent: 0,
             reqs_complete: 0,
             client_view,
@@ -1739,6 +1775,7 @@ impl MasqueConn {
             _body: body.as_ref().map(|b| b.to_vec()),
             dgram_sender,
             upstreams: HashMap::new(),
+            closed_upstreams: Vec::new(),
         };
 
         Box::new(h_conn)
@@ -1747,30 +1784,33 @@ impl MasqueConn {
     pub fn with_conn(
         conn: &mut quiche::Connection, dgram_sender: Option<Http3DgramSender>,
     ) -> Box<dyn HttpConn> {
+        let mut config = quiche::h3::Config::new().unwrap();
+        config.set_dgram_poll_threshold(1);
+        config.set_stream_poll_threshold(1);
+
         let h_conn = MasqueConn {
-            h3_conn: quiche::h3::Connection::with_transport(
-                conn,
-                &quiche::h3::Config::new().unwrap(),
-            )
-            .unwrap(),
+            h3_conn: quiche::h3::Connection::with_transport(conn, &config)
+                .unwrap(),
             reqs_sent: 0,
             reqs_complete: 0,
             client_view: HashMap::new(),
             _body: None,
             dgram_sender,
             upstreams: HashMap::new(),
+            closed_upstreams: Vec::new(),
         };
 
         Box::new(h_conn)
     }
 
     fn validate_tunnel_request(
-        request: &[quiche::h3::Header],
-    ) -> quiche::h3::Result<ProxyType> {
+        request: &[quiche::h3::Header], stream_id: u64,
+    ) -> quiche::h3::Result<(ProxyType, u64)> {
         let mut scheme = None;
         let mut host = None;
         let mut path = None;
         let mut method = None;
+        let mut dgram_flow_id = None;
 
         for hdr in request {
             match hdr.name() {
@@ -1790,22 +1830,45 @@ impl MasqueConn {
                     method = Some(hdr.value());
                 },
 
+                "datagram-flow-id" => {
+                    dgram_flow_id = Some(hdr.value());
+                },
+
                 _ => (),
             }
         }
 
         if scheme.is_some() || path.is_some() {
+            error!("malformed CONNECT request: scheme or path is present");
             return Err(quiche::h3::Error::Done);
         }
 
         // TODO validate host
 
-        let proxy_type = match method {
-            Some("CONNECT") => ProxyType::Http(host.unwrap()),
+        let (proxy_type, id) = match method {
+            Some("CONNECT") => (ProxyType::Http(host.unwrap()), stream_id),
 
             Some("CONNECT-UDP") => {
                 // TODO: pick proxy mode based on headers
-                ProxyType::Udp(host.unwrap())
+
+                match dgram_flow_id {
+                    Some(id) => match id.parse::<u64>() {
+                        Ok(v) => (ProxyType::Udp(host.unwrap()), v),
+
+                        Err(e) => {
+                            error!(
+                                "malformed CONNECT-UDP request: {}",
+                                e.to_string()
+                            );
+                            return Err(quiche::h3::Error::Done);
+                        },
+                    },
+
+                    None => {
+                        error!("malformed CONNECT-UDP request: datagram-flow-id missing");
+                        return Err(quiche::h3::Error::Done);
+                    },
+                }
             },
 
             _ => {
@@ -1815,7 +1878,7 @@ impl MasqueConn {
 
         trace!("proxy_type={:?}", proxy_type);
 
-        Ok(proxy_type)
+        Ok((proxy_type, id))
     }
 }
 
@@ -2070,34 +2133,68 @@ impl HttpConn for MasqueConn {
                 }
             }
 
-            for (stream_id, upstream) in self.upstreams.iter_mut() {
+            for (id, upstream) in self.upstreams.iter_mut() {
                 if let Some(tcp) = &mut upstream.tcp_stream {
                     match tcp.read(buf) {
                         Ok(0) => {
-                            error!("Connection for stream {} closed, TODO reset stream", stream_id);
+                            error!("TCP connection for stream {} closed, TODO reset stream", id);
                         },
+
                         Ok(len) => {
                             trace!(
-                                "read {} bytes from target of stream {}: {:?}",
+                                "read {} TCP bytes from target of stream {}: {:?}",
                                 len,
-                                stream_id,
+                                id,
                                 buf[..len].to_vec()
                             );
 
-                            let resp =
-                                partial_responses.get_mut(&stream_id).unwrap();
+                            let resp = partial_responses.get_mut(&id).unwrap();
                             resp.body.extend_from_slice(&buf[..len]);
                         },
+
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                trace!("read() would block");
+                                continue;
+                            }
+
+                            // TODO: close the request stream
+                            error!("read() failed: {:?}", e);
+                            self.closed_upstreams.push(*id);
+                        },
+                    }
+                }
+
+                if let Some(udp) = &mut upstream.udp_socket {
+                    match udp.recv(buf) {
+                        Ok(len) => {
+                            trace!(
+                                "read {} UDP bytes from target of flow {}: {:?}",
+                                len,
+                                id,
+                                buf[..len].to_vec()
+                            );
+
+                            self.h3_conn.send_dgram(conn, *id, &buf[..len]).ok();
+                        },
+
                         Err(e) => {
                             if e.kind() == std::io::ErrorKind::WouldBlock {
                                 trace!("recv() would block");
                                 continue;
                             }
 
-                            panic!("read() failed: {:?}", e);
+                            // TODO: handle error by removing the upstream and
+                            // closing the request stream
+                            error!("read() failed: {:?}", e);
+                            self.closed_upstreams.push(*id);
                         },
                     }
                 }
+            }
+
+            for id in self.closed_upstreams.drain(..) {
+                self.upstreams.remove(&id);
             }
 
             match self.h3_conn.poll(conn) {
@@ -2109,19 +2206,41 @@ impl HttpConn for MasqueConn {
                         stream_id
                     );
 
-                    let proxy_type = MasqueConn::validate_tunnel_request(&list)?;
+                    let (proxy_type, upstream_key) =
+                        MasqueConn::validate_tunnel_request(&list, stream_id)?;
 
-                    // make the upstream connection
-                    match proxy_type {
+                    // Make the upstream connection.
+                    let res = match proxy_type {
                         ProxyType::Http(ref host) => {
-                            let address =
-                                host.to_socket_addrs().unwrap().next().unwrap();
+                            let address = match host.to_socket_addrs() {
+                                Ok(mut it) => match it.next() {
+                                    Some(v) => v,
+
+                                    None => {
+                                        error!("No address found");
+                                        return Err(quiche::h3::Error::Done);
+                                    },
+                                },
+
+                                Err(e) => {
+                                    error!("{}", e.to_string());
+                                    return Err(quiche::h3::Error::Done);
+                                },
+                            };
 
                             let tcp_stream =
-                                mio::net::TcpStream::connect(&address).unwrap();
+                                match mio::net::TcpStream::connect(&address) {
+                                    Ok(v) => v,
+
+                                    Err(e) => {
+                                        error!("{}", e.to_string());
+                                        return Err(quiche::h3::Error::Done);
+                                    },
+                                };
 
                             let poll = mio::Poll::new().unwrap();
-                            let mut events = mio::Events::with_capacity(1024);
+
+                            let events = mio::Events::with_capacity(1024);
                             poll.register(
                                 &tcp_stream,
                                 mio::Token(0),
@@ -2130,37 +2249,110 @@ impl HttpConn for MasqueConn {
                             )
                             .unwrap();
 
-                            poll.poll(
-                                &mut events,
-                                Some(std::time::Duration::from_millis(100)),
-                            )
-                            .unwrap();
+                            info!(
+                                "connecting to {:} from {:}",
+                                address,
+                                tcp_stream.local_addr().unwrap(),
+                            );
 
-                            self.upstreams.insert(stream_id, Upstream {
+                            self.upstreams.insert(upstream_key, Upstream {
                                 poll,
                                 events,
                                 udp_socket: None,
                                 tcp_stream: Some(tcp_stream),
                             });
+
+                            Ok(())
                         },
 
-                        ProxyType::Udp(_) => {
-                            // TODO
+                        ProxyType::Udp(ref host) => {
+                            let address = match host.to_socket_addrs() {
+                                Ok(mut it) => match it.next() {
+                                    Some(v) => v,
+
+                                    None => {
+                                        error!("No address found");
+                                        return Err(quiche::h3::Error::Done);
+                                    },
+                                },
+
+                                Err(e) => {
+                                    error!("{}", e.to_string());
+                                    return Err(quiche::h3::Error::Done);
+                                },
+                            };
+
+                            // Bind to INADDR_ANY or IN6ADDR_ANY depending on the
+                            // IP family of the server
+                            // address. This is needed on macOS and BSD variants
+                            // that don't
+                            // support binding to IN6ADDR_ANY for both v4 and v6.
+                            let bind_addr = match address {
+                                std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+                                std::net::SocketAddr::V6(_) => "[::]:0",
+                            };
+
+                            let socket =
+                                match std::net::UdpSocket::bind(bind_addr) {
+                                    Ok(v) => v,
+
+                                    Err(e) => {
+                                        error!("{}", e.to_string());
+                                        return Err(quiche::h3::Error::Done);
+                                    },
+                                };
+
+                            match socket.connect(address) {
+                                Ok(_) => (),
+
+                                Err(e) => {
+                                    error!("{}", e.to_string());
+                                    return Err(quiche::h3::Error::Done);
+                                },
+                            };
+
+                            let socket =
+                                mio::net::UdpSocket::from_socket(socket).unwrap();
+
+                            let poll = mio::Poll::new().unwrap();
+
+                            let events = mio::Events::with_capacity(1024);
+                            poll.register(
+                                &socket,
+                                mio::Token(0),
+                                mio::Ready::readable(),
+                                mio::PollOpt::edge(),
+                            )
+                            .unwrap();
+
+                            info!(
+                                "connecting to {:} from {:}",
+                                address,
+                                socket.local_addr().unwrap(),
+                            );
+
+                            self.upstreams.insert(upstream_key, Upstream {
+                                poll,
+                                events,
+                                udp_socket: Some(socket),
+                                tcp_stream: None,
+                            });
+
+                            Ok(())
                         },
 
                         ProxyType::Quic(_) => {
                             // TODO
+                            Ok(())
                         },
 
-                        _ => (),
-                    }
+                        _ => Err(quiche::h3::Error::Done),
+                    };
 
                     trace!("Upstream={:?}", self.upstreams);
 
-                    let (headers, fin) = match proxy_type {
-                        ProxyType::Http(_) |
-                        ProxyType::Udp(_) |
-                        ProxyType::Quic(_) => (
+                    let (headers, fin) = match (res, proxy_type) {
+                        (Ok(_), ProxyType::Http(_)) => (
                             vec![
                                 quiche::h3::Header::new(
                                     ":status",
@@ -2174,11 +2366,44 @@ impl HttpConn for MasqueConn {
                             false,
                         ),
 
-                        _ => (
+                        (Ok(_), ProxyType::Udp(_)) |
+                        (Ok(_), ProxyType::Quic(_)) => (
+                            vec![
+                                quiche::h3::Header::new(
+                                    ":status",
+                                    &200.to_string(),
+                                ),
+                                quiche::h3::Header::new(
+                                    "server",
+                                    "quiche-masque",
+                                ),
+                                quiche::h3::Header::new(
+                                    "datagram-flow-id",
+                                    &upstream_key.to_string(),
+                                ),
+                            ],
+                            false,
+                        ),
+
+                        (Ok(_), _) => (
                             vec![
                                 quiche::h3::Header::new(
                                     ":status",
                                     &505.to_string(),
+                                ),
+                                quiche::h3::Header::new(
+                                    "server",
+                                    "quiche-masque",
+                                ),
+                            ],
+                            true,
+                        ),
+
+                        (Err(_), _) => (
+                            vec![
+                                quiche::h3::Header::new(
+                                    ":status",
+                                    &500.to_string(),
                                 ),
                                 quiche::h3::Header::new(
                                     "server",
@@ -2213,7 +2438,7 @@ impl HttpConn for MasqueConn {
                             read, stream_id
                         );
 
-                        error!(
+                        debug!(
                             "got in inner tunnel was {:?}",
                             buf[..read].to_vec()
                         );
@@ -2227,7 +2452,7 @@ impl HttpConn for MasqueConn {
                                 req: buf[..read].to_vec(),
                             };
 
-                            error!("len req = {}", request.req.len());
+                            debug!("len req = {}", request.req.len());
 
                             partial_requests.insert(stream_id, request);
                         }
@@ -2236,15 +2461,42 @@ impl HttpConn for MasqueConn {
 
                 Ok((_stream_id, quiche::h3::Event::Finished)) => (),
 
-                Ok((_, quiche::h3::Event::Datagram)) => {
-                    let (len, flow_id, flow_id_len) =
-                        self.h3_conn.recv_dgram(conn, buf).unwrap();
+                Ok((flow_id, quiche::h3::Event::Datagram)) => {
+                    // Even though we got a Datagram event, we only read it if
+                    // there is a related upstream.
+                    if let Some(upstream) = self.upstreams.get_mut(&flow_id) {
+                        if let Some(udp) = &mut upstream.udp_socket {
+                            let (len, flow_id, flow_id_len) =
+                                self.h3_conn.recv_dgram(conn, buf).unwrap();
 
-                    info!(
-                        "Received DATAGRAM flow_id={} data={:?}",
-                        flow_id,
-                        &buf[flow_id_len..len].to_vec()
-                    );
+                            info!(
+                                "Received HTTP/3 DATAGRAM from client flow_id={} data={:?}",
+                                flow_id,
+                                &buf[flow_id_len..len].to_vec()
+                            );
+
+                            match udp.send(&buf[flow_id_len..len]) {
+                                Ok(written) => {
+                                    trace!("{} bytes sent to target", written);
+                                },
+
+                                Err(e) => {
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                    {
+                                        trace!("write() would block");
+                                        // break;
+                                        continue;
+                                    }
+
+                                    panic!("read() failed: {:?}", e);
+                                },
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    break;
                 },
 
                 Ok((_id, quiche::h3::Event::GoAway)) => (),
@@ -2325,7 +2577,7 @@ impl HttpConn for MasqueConn {
 
         // Once the CONNECT response has been sent, we move on to sending payload
         // received from the target as body data.
-        if resp.body.len() != 0 {
+        if !resp.body.is_empty() {
             trace!(
                 "ready to send {} bytes to stream {}",
                 resp.body.len(),
@@ -2389,10 +2641,17 @@ impl HttpConn for MasqueConn {
                             return;
                         }
 
-                        panic!("read() failed: {:?}", e);
+                        // TODO: handle error by removing the upstream and
+                        // closing the request stream
+                        error!("read() failed: {:?}", e);
+                        self.closed_upstreams.push(stream_id);
                     },
                 }
             }
+        }
+
+        for id in self.closed_upstreams.drain(..) {
+            self.upstreams.remove(&id);
         }
     }
 }

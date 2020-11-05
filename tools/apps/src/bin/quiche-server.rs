@@ -149,7 +149,7 @@ fn main() {
         config.enable_hystart(false);
     }
 
-    if conn_args.dgrams_enabled {
+    if conn_args.dgrams_enabled || args.masque {
         config.enable_dgram(true, 1000, 1000);
     }
 

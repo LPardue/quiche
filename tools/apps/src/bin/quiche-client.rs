@@ -173,7 +173,11 @@ fn main() {
         config.enable_hystart(false);
     }
 
-    if conn_args.dgrams_enabled {
+    let proxy_type = get_proxy_type();
+    let masque = matches!(&proxy_type, ProxyType::Http(_) | 
+                                ProxyType::Udp(_) | ProxyType::Quic(_));
+
+    if conn_args.dgrams_enabled || masque {
         config.enable_dgram(true, 1000, 1000);
     }
 
@@ -334,8 +338,14 @@ fn main() {
             let app_proto = conn.application_proto();
             let app_proto = &std::str::from_utf8(&app_proto).unwrap();
 
-            let proxy_type = get_proxy_type();
-            if let ProxyType::Http(_) = proxy_type {
+            if masque {
+                // TODO: remove this
+                let dgram_sender = Some(Http3DgramSender::new(
+                    10,
+                    "HELLO MASQUE".to_string(),
+                    0,
+                ));
+
                 http_conn = Some(MasqueConn::with_urls(
                     &mut conn,
                     &args.urls,
@@ -343,8 +353,8 @@ fn main() {
                     &args.req_headers,
                     &args.body,
                     &args.method,
-                    None,
-                    proxy_type,
+                    dgram_sender,
+                    &proxy_type,
                 ));
                 app_proto_selected = true;
             } else if alpns::HTTP_09.contains(app_proto) {
