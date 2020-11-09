@@ -1,0 +1,1220 @@
+// Copyright (C) 2020, Cloudflare, Inc.
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//     * Redistributions of source code must retain the above copyright notice,
+//       this list of conditions and the following disclaimer.
+//
+//     * Redistributions in binary form must reproduce the above copyright
+//       notice, this list of conditions and the following disclaimer in the
+//       documentation and/or other materials provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+// IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO,
+// THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+// PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+// LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+// NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+// SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+use std::net::ToSocketAddrs;
+
+use std::io::prelude::*;
+
+use std::collections::HashMap;
+
+use quiche::h3::NameValue;
+
+use super::args::*;
+use super::common::*;
+
+const MAX_INNER_DATAGRAM_SIZE: usize = 1250;
+
+#[derive(Clone, Debug)]
+pub enum ProxyType {
+    Direct,
+    Http(String),
+    Udp(String),
+    Quic(String),
+}
+
+impl Default for ProxyType {
+    fn default() -> Self {
+        ProxyType::Direct
+    }
+}
+
+pub fn get_proxy_type() -> ProxyType {
+    if let Some(p) = std::env::var_os("HTTP_PROXY") {
+        return ProxyType::Http(p.to_str().unwrap().to_owned());
+    }
+
+    if let Some(p) = std::env::var_os("UDP_PROXY") {
+        return ProxyType::Udp(p.to_str().unwrap().to_owned());
+    }
+
+    if let Some(p) = std::env::var_os("QUIC_PROXY") {
+        return ProxyType::Quic(p.to_str().unwrap().to_owned());
+    }
+
+    ProxyType::Direct
+}
+
+fn validate_tunnel_request(
+    request: &[quiche::h3::Header], stream_id: u64,
+) -> quiche::h3::Result<(ProxyType, u64)> {
+    let mut scheme = None;
+    let mut host = None;
+    let mut path = None;
+    let mut method = None;
+    let mut dgram_flow_id = None;
+
+    for hdr in request {
+        match hdr.name() {
+            ":scheme" => {
+                scheme = Some(hdr.value());
+            },
+
+            ":authority" | "host" => {
+                host = Some(hdr.value().to_string());
+            },
+
+            ":path" => {
+                path = Some(hdr.value());
+            },
+
+            ":method" => {
+                method = Some(hdr.value());
+            },
+
+            "datagram-flow-id" => {
+                dgram_flow_id = Some(hdr.value());
+            },
+
+            _ => (),
+        }
+    }
+
+    if scheme.is_some() || path.is_some() {
+        error!("malformed CONNECT request: scheme or path is present");
+        return Err(quiche::h3::Error::Done);
+    }
+
+    // TODO validate host
+
+    let (proxy_type, id) = match method {
+        Some("CONNECT") => (ProxyType::Http(host.unwrap()), stream_id),
+
+        Some("CONNECT-UDP") => {
+            // TODO: pick proxy mode based on headers
+
+            match dgram_flow_id {
+                Some(id) => match id.parse::<u64>() {
+                    Ok(v) => (ProxyType::Udp(host.unwrap()), v),
+
+                    Err(e) => {
+                        error!(
+                            "malformed CONNECT-UDP request: {}",
+                            e.to_string()
+                        );
+                        return Err(quiche::h3::Error::Done);
+                    },
+                },
+
+                None => {
+                    error!(
+                        "malformed CONNECT-UDP request: datagram-flow-id missing"
+                    );
+                    return Err(quiche::h3::Error::Done);
+                },
+            }
+        },
+
+        _ => {
+            return Err(quiche::h3::Error::Done);
+        },
+    };
+
+    trace!("proxy_type={:?}", proxy_type);
+
+    Ok((proxy_type, id))
+}
+
+fn authority_form(url: &url::Url) -> String {
+    format!(
+        "{}:{}",
+        url.host_str().unwrap(),
+        url.port_or_known_default().unwrap()
+    )
+}
+
+#[derive(Debug)]
+pub struct Upstream {
+    poll: mio::Poll,
+    events: mio::Events,
+    udp_socket: Option<mio::net::UdpSocket>,
+    tcp_stream: Option<mio::tcp::TcpStream>,
+}
+
+pub struct ConnectContext {
+    connect_reqs: Vec<Http3Request>, // vector but only need one?
+    inner_h11_reqs: Option<Vec<Http11Request>>,
+    inner_quic_conn: Option<Client>,
+    flow_id: Option<u64>,
+    proxy_type: ProxyType,
+}
+
+pub type ContextMap = HashMap<String, ConnectContext>;
+
+pub struct MasqueConn {
+    h3_conn: quiche::h3::Connection,
+    reqs_sent: usize,
+    _reqs_complete: usize,
+    client_view: ContextMap,
+    _body: Option<Vec<u8>>,
+    upstreams: HashMap<u64, Upstream>,
+    closed_upstreams: Vec<u64>,
+}
+
+impl MasqueConn {
+    pub fn with_urls(
+        conn: &mut quiche::Connection, urls: &[url::Url], reqs_cardinal: u64,
+        req_headers: &[String], body: &Option<Vec<u8>>, method: &str,
+        _dgram_sender: Option<Http3DgramSender>, proxy_type: &ProxyType,
+    ) -> Box<dyn HttpConn> {
+        let mut client_view = ContextMap::new();
+
+        let mut flow_id = 0;
+
+        // From the given set of URLs:
+        // 1) find the unique target server, there will be one CONNECT to this
+        // 2) gather all URLs to the target, there will be one or more requests
+        //    that get tunneled on the stream created in (1).
+        for url in urls {
+            let authority = authority_form(&url);
+
+            match client_view.get_mut(&authority) {
+                // Append
+                Some(v) => match proxy_type {
+                    ProxyType::Http(_) => {
+                        let mut reqs = Http11Request::generate(
+                            &[url.clone()],
+                            reqs_cardinal,
+                        );
+                        v.inner_h11_reqs.as_mut().unwrap().append(&mut reqs);
+                    },
+
+                    _ => (),
+                },
+
+                // Populate first entry
+                None => {
+                    let (
+                        conn_method,
+                        inner_h11_reqs,
+                        flow_id,
+                        connect_headers,
+                        inner_quic_conn,
+                    ) = match proxy_type {
+                        ProxyType::Http(_) => (
+                            "CONNECT",
+                            Some(Http11Request::generate(
+                                &[url.clone()],
+                                reqs_cardinal,
+                            )),
+                            // None,
+                            None,
+                            req_headers.to_vec(),
+                            None,
+                        ),
+
+                        ProxyType::Udp(_) => {
+                            let current_flow_id = flow_id;
+                            flow_id += 4;
+
+                            let mut connect_headers = req_headers.to_vec();
+                            connect_headers.push(format!(
+                                "datagram-flow-id: {}",
+                                current_flow_id
+                            ));
+
+                            // Parse CLI parameters.
+                            let docopt =
+                                docopt::Docopt::new(CLIENT_USAGE).unwrap();
+                            let conn_args = CommonArgs::with_docopt(&docopt);
+                            let mut args = ClientArgs::with_docopt(&docopt);
+
+                            // Filter the urls to the current CONNECT authority
+                            args.urls.retain(|u| authority_form(u) == authority);
+
+                            let (qc, scid) = Client::with_url(
+                                url,
+                                args,
+                                conn_args,
+                                MAX_INNER_DATAGRAM_SIZE,
+                                ProxyType::Direct,
+                            );
+
+                            info!(
+                                "created inner QUIC connection with SCID {:?}",
+                                &scid
+                            );
+
+                            (
+                                "CONNECT-UDP",
+                                None,
+                                Some(current_flow_id),
+                                connect_headers,
+                                Some(qc),
+                            )
+                        },
+
+                        // TODO: this CONNECT-UDP method needs some extra
+                        // headers. Figure out how to handle this.
+                        ProxyType::Quic(_) => (
+                            "CONNECT-UDP",
+                            None,
+                            None,
+                            req_headers.to_vec(),
+                            None,
+                        ),
+
+                        _ => (method, None, None, req_headers.to_vec(), None),
+                    };
+
+                    let cc = ConnectContext {
+                        connect_reqs: Http3Request::generate(
+                            &[url.clone()],
+                            1,
+                            conn_method,
+                            &connect_headers,
+                            None,
+                        ),
+                        inner_h11_reqs,
+                        flow_id,
+                        inner_quic_conn,
+                        proxy_type: proxy_type.clone(),
+                    };
+                    client_view.insert(authority, cc);
+                },
+            }
+        }
+
+        // trace!("client view is {:?}", client_view);
+        let mut config = quiche::h3::Config::new().unwrap();
+        config.set_dgram_poll_threshold(1);
+        config.set_stream_poll_threshold(1);
+
+        let h_conn = MasqueConn {
+            h3_conn: quiche::h3::Connection::with_transport(conn, &config)
+                .unwrap(),
+            reqs_sent: 0,
+            _reqs_complete: 0,
+            client_view,
+
+            _body: body.as_ref().map(|b| b.to_vec()),
+            upstreams: HashMap::new(),
+            closed_upstreams: Vec::new(),
+        };
+
+        Box::new(h_conn)
+    }
+
+    pub fn with_conn(
+        conn: &mut quiche::Connection, _dgram_sender: Option<Http3DgramSender>,
+    ) -> Box<dyn HttpConn> {
+        let mut config = quiche::h3::Config::new().unwrap();
+        config.set_dgram_poll_threshold(1);
+        config.set_stream_poll_threshold(1);
+
+        let h_conn = MasqueConn {
+            h3_conn: quiche::h3::Connection::with_transport(conn, &config)
+                .unwrap(),
+            reqs_sent: 0,
+            _reqs_complete: 0,
+            client_view: HashMap::new(),
+            _body: None,
+            upstreams: HashMap::new(),
+            closed_upstreams: Vec::new(),
+        };
+
+        Box::new(h_conn)
+    }
+}
+
+impl HttpConn for MasqueConn {
+    fn send_requests(
+        &mut self, conn: &mut quiche::Connection, _target_path: &Option<String>,
+    ) {
+        let mut reqs_done = 0;
+
+        for (target, context) in self.client_view.iter_mut().skip(self.reqs_sent)
+        {
+            debug!("sending HTTP CONNECT request for {}", target);
+
+            let req = context.connect_reqs.first_mut().unwrap();
+            let s = match self.h3_conn.send_request(conn, &req.hdrs, false) {
+                Ok(v) => v,
+
+                Err(quiche::h3::Error::TransportError(
+                    quiche::Error::StreamLimit,
+                )) => {
+                    debug!("not enough stream credits, retry later...");
+                    break;
+                },
+
+                Err(quiche::h3::Error::StreamBlocked) => {
+                    debug!("stream is blocked, retry later...");
+                    break;
+                },
+
+                Err(e) => {
+                    error!("failed to send request {:?}", e);
+                    break;
+                },
+            };
+
+            debug!("sending HTTP CONNECT request {:?}", req.hdrs);
+
+            req.stream_id = Some(s);
+
+            // No response writer for CONNECT requests.
+            req.response_writer = None;
+
+            // When proxying HTTP, we'll have some requests to send on this
+            // connected stream. The following code is very basic, if there is
+            // any problem writing to the stream (such as if the stream is flow
+            // control blocked), then we just give up. We'll never come back to
+            // this stream to retry.
+            if let Some(inner_reqs) = &context.inner_h11_reqs {
+                for inner_req in inner_reqs.iter() {
+                    if let Err(e) = self.h3_conn.send_body(
+                        conn,
+                        s,
+                        inner_req.request.as_bytes(),
+                        false,
+                    ) {
+                        error!("failed to send inner HTTP request {:?}", e);
+
+                        // TODO: store and retry
+                        break;
+                    }
+                }
+            }
+
+            reqs_done += 1;
+        }
+
+        self.reqs_sent += reqs_done;
+
+        // We don't wait for the CONNECT-UDP response before starting to send
+        // DATAGRAMS.
+        let mut out = [0; MAX_INNER_DATAGRAM_SIZE];
+        for (_target, context) in self.client_view.iter_mut() {
+            if let Some(inner) = &mut context.inner_quic_conn {
+                if let Some(h_conn) = &mut inner.http_conn {
+                    let path = &inner.args.as_ref().unwrap().dump_response_path;
+                    h_conn.send_requests(&mut inner.conn, path);
+                }
+
+                // Generate outgoing QUIC packets and send them on DATAGRAM flow,
+                // until quiche reports that there are no more
+                // packets to be sent.
+                loop {
+                    let write = match inner.conn.send(&mut out) {
+                        Ok(v) => v,
+
+                        Err(quiche::Error::Done) => {
+                            trace!("done writing");
+                            break;
+                        },
+
+                        Err(e) => {
+                            error!("send failed: {:?}", e);
+
+                            inner.conn.close(false, 0x1, b"fail").ok();
+                            break;
+                        },
+                    };
+
+                    debug!(
+                        "sending HTTP/3 DATAGRAM on flow_id={}",
+                        context.flow_id.unwrap(),
+                    );
+
+                    match self.h3_conn.send_dgram(
+                        conn,
+                        context.flow_id.unwrap(),
+                        &out[..write],
+                    ) {
+                        Ok(v) => v,
+
+                        Err(e) => {
+                            error!("failed to send dgram {:?}", e);
+                            break;
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_responses(
+        &mut self, conn: &mut quiche::Connection, buf: &mut [u8],
+        req_start: &std::time::Instant,
+    ) {
+        // TODO: avoid doing a lot of work if we know all has all been done.
+        if self.is_complete() {
+            return;
+        }
+        // TODO: checking internal QUIC timeouts here in order to make sure it
+        // happens, probably some better way to do it.
+        for (_target, context) in self.client_view.iter_mut() {
+            if let Some(inner) = &mut context.inner_quic_conn {
+                inner.conn.on_timeout();
+            }
+        }
+
+        loop {
+            match self.h3_conn.poll(conn) {
+                Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                    info!(
+                        "got response headers {:?} on stream id {}",
+                        list, stream_id
+                    );
+                },
+
+                Ok((stream_id, quiche::h3::Event::Data)) => {
+                    if let Ok(read) = self.h3_conn.recv_body(conn, stream_id, buf)
+                    {
+                        debug!(
+                            "got {} bytes of response data on stream {}",
+                            read, stream_id
+                        );
+
+                        let entry = self
+                            .client_view
+                            .iter_mut()
+                            .find(|(_k, v)| {
+                                v.connect_reqs.first().unwrap().stream_id ==
+                                    Some(stream_id)
+                            })
+                            .unwrap();
+
+                        match &mut entry
+                            .1
+                            .connect_reqs
+                            .first_mut()
+                            .unwrap()
+                            .response_writer
+                        {
+                            Some(rw) => {
+                                rw.write_all(&buf[..read]).ok();
+                            },
+
+                            None => {
+                                print!("{}", unsafe {
+                                    std::str::from_utf8_unchecked(&buf[..read])
+                                });
+                            },
+                        }
+                    }
+                },
+
+                Ok((_stream_id, quiche::h3::Event::Finished)) => {
+                    // TODO: properly detect end of connect and tunneled requests.
+
+                    /*self.reqs_complete += 1;
+                    let reqs_count = self.connect_reqs.len();
+
+                    debug!(
+                        "{}/{} responses received",
+                        self.reqs_complete, reqs_count
+                    );
+
+                    if self.reqs_complete == reqs_count {
+                        info!(
+                            "{}/{} response(s) received in {:?}, closing...",
+                            self.reqs_complete,
+                            reqs_count,
+                            req_start.elapsed()
+                        );
+
+                        match conn.close(true, 0x00, b"kthxbye") {
+                            // Already closed.
+                            Ok(_) | Err(quiche::Error::Done) => (),
+
+                            Err(e) => panic!("error closing conn: {:?}", e),
+                        }
+
+                        break;
+                    }*/
+                },
+
+                Ok((_flow_id, quiche::h3::Event::Datagram)) => {
+                    let (len, flow_id, flow_id_len) =
+                        self.h3_conn.recv_dgram(conn, buf).unwrap();
+
+                    trace!(
+                        "received HTTP/3 DATAGRAM flow_id={} len={}",
+                        flow_id,
+                        len,
+                    );
+
+                    // Lookup the inner QUIC connection and feed it the received
+                    // packets.
+                    let entry = self
+                        .client_view
+                        .iter_mut()
+                        .find(|(_k, v)| v.flow_id == Some(flow_id))
+                        .unwrap();
+
+                    if let Some(inner) = &mut entry.1.inner_quic_conn {
+                        let read =
+                            match inner.conn.recv(&mut buf[flow_id_len..len]) {
+                                Ok(v) => v,
+
+                                Err(e) => {
+                                    error!("internal recv failed: {:?}", e);
+                                    continue;
+                                },
+                            };
+
+                        trace!("processed {} bytes", read);
+
+                        // Create a new HTTP/3 connection once QUIC is
+                        // established.
+                        inner.make_app_proto();
+
+                        // Check to see any thing happened in HTTP/3.
+                        if let Some(h_conn) = inner.http_conn.as_mut() {
+                            h_conn.handle_responses(
+                                &mut inner.conn,
+                                buf,
+                                &inner.start_time,
+                            );
+                        }
+                    }
+                },
+
+                Ok((_id, quiche::h3::Event::GoAway)) => (),
+
+                Err(quiche::h3::Error::Done) => {
+                    break;
+                },
+
+                Err(e) => {
+                    error!("HTTP/3 processing failed: {:?}", e);
+
+                    break;
+                },
+            }
+        }
+
+        if self.is_complete() {
+            info!(
+                "All inner connections complete their actions in {:?}, closing",
+                req_start.elapsed()
+            );
+            match conn.close(true, 0x00, b"kthxbye") {
+                // Already closed.
+                Ok(_) | Err(quiche::Error::Done) => (),
+
+                Err(e) => panic!("error closing conn: {:?}", e),
+            }
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        let mut inner_complete = true;
+
+        for (_, client) in &self.client_view {
+            match client.proxy_type {
+                ProxyType::Http(_) => {
+                    // TODO: it's hard to detect whether all the HTTP/1.1
+                    // requests completed successfully, so just say they didn't
+                    // for now.
+                    return false;
+                },
+
+                ProxyType::Udp(_) | ProxyType::Quic(_) => {
+                    // We have to have made an inner QUIC and HTTP/3 connection,
+                    // and run them to completion before we declare things done.
+                    if let Some(qc) = &client.inner_quic_conn {
+                        if let Some(h_conn) = &qc.http_conn {
+                            inner_complete =
+                                inner_complete && h_conn.is_complete();
+                        } else {
+                            inner_complete = false;
+                        }
+                    }
+                },
+
+                _ => unreachable!(),
+            }
+        }
+
+        self.reqs_sent == self.client_view.len() && inner_complete
+    }
+
+    fn report_incomplete(&self, start: &std::time::Instant) -> bool {
+        if !self.is_complete() {
+            error!(
+                "MASQUE connection timed out after {:?} and sent {} connect requests",
+                start.elapsed(),
+                self.reqs_sent,
+            );
+
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_requests(
+        &mut self, conn: &mut std::pin::Pin<Box<quiche::Connection>>,
+        partial_requests: &mut HashMap<u64, PartialRequest>,
+        partial_responses: &mut HashMap<u64, PartialResponse>, _root: &str,
+        _index: &str, buf: &mut [u8],
+    ) -> quiche::h3::Result<()> {
+        // Process HTTP events.
+        loop {
+            // check partial requests, flush as much pending data to socket as
+            // possible
+            for (stream_id, partial) in partial_requests.iter_mut() {
+                trace!("There are {} bytes to send to target", partial.req.len());
+                if partial.req.is_empty() {
+                    continue;
+                }
+
+                if let Some(upstream) = self.upstreams.get_mut(stream_id) {
+                    if let Some(tcp) = &mut upstream.tcp_stream {
+                        match tcp.write(partial.req.as_slice()) {
+                            Ok(written) => {
+                                trace!("{} bytes sent to target", written);
+
+                                partial.req.drain(..written);
+                            },
+
+                            Err(e) => {
+                                if e.kind() == std::io::ErrorKind::WouldBlock {
+                                    trace!("write() would block");
+                                    // break;
+                                    continue;
+                                }
+
+                                panic!("read() failed: {:?}", e);
+                            },
+                        }
+                    }
+                }
+            }
+
+            for (id, upstream) in self.upstreams.iter_mut() {
+                if let Some(tcp) = &mut upstream.tcp_stream {
+                    match tcp.read(buf) {
+                        Ok(0) => {
+                            error!("TCP connection for stream {} closed, TODO reset stream", id);
+                        },
+
+                        Ok(len) => {
+                            trace!(
+                                "read {} TCP bytes from target of stream {}: {:?}",
+                                len,
+                                id,
+                                buf[..len].to_vec()
+                            );
+
+                            let resp = partial_responses.get_mut(&id).unwrap();
+                            resp.body.extend_from_slice(&buf[..len]);
+                        },
+
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                trace!("read() would block");
+                                continue;
+                            }
+
+                            // TODO: close the request stream
+                            error!("read() failed: {:?}", e);
+                            self.closed_upstreams.push(*id);
+                        },
+                    }
+                }
+
+                if let Some(udp) = &mut upstream.udp_socket {
+                    match udp.recv(buf) {
+                        Ok(len) => {
+                            trace!(
+                                "read {} UDP bytes from target of flow {}: {:?}",
+                                len,
+                                id,
+                                buf[..len].to_vec()
+                            );
+
+                            match self.h3_conn.send_dgram(conn, *id, &buf[..len])
+                            {
+                                Ok(v) => v,
+
+                                Err(e) => {
+                                    error!("failed to send dgram {:?}", e);
+                                    break;
+                                },
+                            }
+                        },
+
+                        Err(e) => {
+                            if e.kind() == std::io::ErrorKind::WouldBlock {
+                                trace!("recv() would block");
+                                continue;
+                            }
+
+                            // TODO: handle error by removing the upstream and
+                            // closing the request stream
+                            error!("read() failed: {:?}", e);
+                            self.closed_upstreams.push(*id);
+                        },
+                    }
+                }
+            }
+
+            for id in self.closed_upstreams.drain(..) {
+                self.upstreams.remove(&id);
+            }
+
+            match self.h3_conn.poll(conn) {
+                Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                    info!(
+                        "{} got request {:?} on stream id {}",
+                        conn.trace_id(),
+                        &list,
+                        stream_id
+                    );
+
+                    let (proxy_type, upstream_key) =
+                        validate_tunnel_request(&list, stream_id)?;
+
+                    // Make the upstream connection.
+                    let res = match proxy_type {
+                        ProxyType::Http(ref host) => {
+                            let address = match host.to_socket_addrs() {
+                                Ok(mut it) => match it.next() {
+                                    Some(v) => v,
+
+                                    None => {
+                                        error!("No address found");
+                                        return Err(quiche::h3::Error::Done);
+                                    },
+                                },
+
+                                Err(e) => {
+                                    error!("{}", e.to_string());
+                                    return Err(quiche::h3::Error::Done);
+                                },
+                            };
+
+                            let tcp_stream =
+                                match mio::net::TcpStream::connect(&address) {
+                                    Ok(v) => v,
+
+                                    Err(e) => {
+                                        error!("{}", e.to_string());
+                                        return Err(quiche::h3::Error::Done);
+                                    },
+                                };
+
+                            let poll = mio::Poll::new().unwrap();
+
+                            let events = mio::Events::with_capacity(1024);
+                            poll.register(
+                                &tcp_stream,
+                                mio::Token(0),
+                                mio::Ready::writable(),
+                                mio::PollOpt::edge(),
+                            )
+                            .unwrap();
+
+                            info!(
+                                "connecting to {:} from {:}",
+                                address,
+                                tcp_stream.local_addr().unwrap(),
+                            );
+
+                            self.upstreams.insert(upstream_key, Upstream {
+                                poll,
+                                events,
+                                udp_socket: None,
+                                tcp_stream: Some(tcp_stream),
+                            });
+
+                            Ok(())
+                        },
+
+                        ProxyType::Udp(ref host) => {
+                            let address = match host.to_socket_addrs() {
+                                Ok(mut it) => match it.next() {
+                                    Some(v) => v,
+
+                                    None => {
+                                        error!("No address found");
+                                        return Err(quiche::h3::Error::Done);
+                                    },
+                                },
+
+                                Err(e) => {
+                                    error!("{}", e.to_string());
+                                    return Err(quiche::h3::Error::Done);
+                                },
+                            };
+
+                            // Bind to INADDR_ANY or IN6ADDR_ANY depending on the
+                            // IP family of the server
+                            // address. This is needed on macOS and BSD variants
+                            // that don't
+                            // support binding to IN6ADDR_ANY for both v4 and v6.
+                            let bind_addr = match address {
+                                std::net::SocketAddr::V4(_) => "0.0.0.0:0",
+                                std::net::SocketAddr::V6(_) => "[::]:0",
+                            };
+
+                            let socket =
+                                match std::net::UdpSocket::bind(bind_addr) {
+                                    Ok(v) => v,
+
+                                    Err(e) => {
+                                        error!("{}", e.to_string());
+                                        return Err(quiche::h3::Error::Done);
+                                    },
+                                };
+
+                            match socket.connect(address) {
+                                Ok(_) => (),
+
+                                Err(e) => {
+                                    error!("{}", e.to_string());
+                                    return Err(quiche::h3::Error::Done);
+                                },
+                            };
+
+                            let socket =
+                                mio::net::UdpSocket::from_socket(socket).unwrap();
+
+                            let poll = mio::Poll::new().unwrap();
+
+                            let events = mio::Events::with_capacity(1024);
+                            poll.register(
+                                &socket,
+                                mio::Token(0),
+                                mio::Ready::readable(),
+                                mio::PollOpt::edge(),
+                            )
+                            .unwrap();
+
+                            info!(
+                                "connecting to {:} from {:}",
+                                address,
+                                socket.local_addr().unwrap(),
+                            );
+
+                            self.upstreams.insert(upstream_key, Upstream {
+                                poll,
+                                events,
+                                udp_socket: Some(socket),
+                                tcp_stream: None,
+                            });
+
+                            Ok(())
+                        },
+
+                        ProxyType::Quic(_) => {
+                            // TODO
+                            Ok(())
+                        },
+
+                        _ => Err(quiche::h3::Error::Done),
+                    };
+
+                    trace!("Upstream={:?}", self.upstreams);
+
+                    let (headers, fin) = match (res, proxy_type) {
+                        (Ok(_), ProxyType::Http(_)) => (
+                            vec![
+                                quiche::h3::Header::new(
+                                    ":status",
+                                    &200.to_string(),
+                                ),
+                                quiche::h3::Header::new(
+                                    "server",
+                                    "quiche-masque",
+                                ),
+                            ],
+                            false,
+                        ),
+
+                        (Ok(_), ProxyType::Udp(_)) |
+                        (Ok(_), ProxyType::Quic(_)) => (
+                            vec![
+                                quiche::h3::Header::new(
+                                    ":status",
+                                    &200.to_string(),
+                                ),
+                                quiche::h3::Header::new(
+                                    "server",
+                                    "quiche-masque",
+                                ),
+                                quiche::h3::Header::new(
+                                    "datagram-flow-id",
+                                    &upstream_key.to_string(),
+                                ),
+                            ],
+                            false,
+                        ),
+
+                        (Ok(_), _) => (
+                            vec![
+                                quiche::h3::Header::new(
+                                    ":status",
+                                    &505.to_string(),
+                                ),
+                                quiche::h3::Header::new(
+                                    "server",
+                                    "quiche-masque",
+                                ),
+                            ],
+                            true,
+                        ),
+
+                        (Err(_), _) => (
+                            vec![
+                                quiche::h3::Header::new(
+                                    ":status",
+                                    &500.to_string(),
+                                ),
+                                quiche::h3::Header::new(
+                                    "server",
+                                    "quiche-masque",
+                                ),
+                            ],
+                            true,
+                        ),
+                    };
+
+                    let response = PartialResponse {
+                        headers: Some(headers),
+                        body: Vec::new(),
+                        written: 0,
+                        fin,
+                    };
+
+                    partial_responses.insert(stream_id, response);
+                },
+
+                Ok((stream_id, quiche::h3::Event::Data)) => {
+                    info!(
+                        "{} got data on stream id {}",
+                        conn.trace_id(),
+                        stream_id
+                    );
+
+                    if let Ok(read) = self.h3_conn.recv_body(conn, stream_id, buf)
+                    {
+                        debug!(
+                            "got {} bytes of inner tunnel data on stream {}",
+                            read, stream_id
+                        );
+
+                        debug!(
+                            "got in inner tunnel was {:?}",
+                            buf[..read].to_vec()
+                        );
+
+                        if let Some(partial) =
+                            partial_requests.get_mut(&stream_id)
+                        {
+                            partial.req.extend_from_slice(&buf[..read]);
+                        } else {
+                            let request = PartialRequest {
+                                req: buf[..read].to_vec(),
+                            };
+
+                            debug!("len req = {}", request.req.len());
+
+                            partial_requests.insert(stream_id, request);
+                        }
+                    }
+                },
+
+                Ok((_stream_id, quiche::h3::Event::Finished)) => (),
+
+                Ok((flow_id, quiche::h3::Event::Datagram)) => {
+                    // Even though we got a Datagram event, we only read it if
+                    // there is a related upstream.
+                    if let Some(upstream) = self.upstreams.get_mut(&flow_id) {
+                        if let Some(udp) = &mut upstream.udp_socket {
+                            let (len, flow_id, flow_id_len) =
+                                self.h3_conn.recv_dgram(conn, buf).unwrap();
+
+                            trace!(
+                                "received HTTP/3 DATAGRAM from client flow_id={} data={:?}",
+                                flow_id,
+                                &buf[flow_id_len..len].to_vec()
+                            );
+
+                            match udp.send(&buf[flow_id_len..len]) {
+                                Ok(written) => {
+                                    trace!("{} bytes sent to target", written);
+                                },
+
+                                Err(e) => {
+                                    if e.kind() == std::io::ErrorKind::WouldBlock
+                                    {
+                                        trace!("write() would block");
+                                        // break;
+                                        continue;
+                                    }
+
+                                    panic!("read() failed: {:?}", e);
+                                },
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+
+                    break;
+                },
+
+                Ok((_id, quiche::h3::Event::GoAway)) => (),
+
+                Err(quiche::h3::Error::Done) => {
+                    break;
+                },
+
+                Err(e) => {
+                    error!("{} HTTP/3 error {:?}", conn.trace_id(), e);
+
+                    return Err(e);
+                },
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_writable(
+        &mut self, conn: &mut std::pin::Pin<Box<quiche::Connection>>,
+        partial_responses: &mut HashMap<u64, PartialResponse>, stream_id: u64,
+    ) {
+        trace!("{} stream {} is writable", conn.trace_id(), stream_id);
+
+        if !partial_responses.contains_key(&stream_id) {
+            return;
+        }
+
+        let resp = partial_responses.get_mut(&stream_id).unwrap();
+
+        if let Some(ref headers) = resp.headers {
+            trace!("writing CONNECT response headers");
+            match self.h3_conn.send_response(conn, stream_id, &headers, false) {
+                Ok(_) => (),
+
+                Err(quiche::h3::Error::StreamBlocked) => {
+                    return;
+                },
+
+                Err(e) => {
+                    error!("{} stream send failed {:?}", conn.trace_id(), e);
+                    return;
+                },
+            }
+        }
+
+        resp.headers = None;
+
+        // Once the CONNECT response has been sent, we move on to sending payload
+        // received from the target as body data.
+        if !resp.body.is_empty() {
+            trace!(
+                "ready to send {} bytes to stream {}",
+                resp.body.len(),
+                stream_id
+            );
+
+            let written = match self
+                .h3_conn
+                .send_body(conn, stream_id, &resp.body, false)
+            {
+                Ok(v) => v,
+
+                Err(quiche::h3::Error::Done) => {
+                    return;
+                },
+
+                Err(e) => {
+                    error!("{} stream send failed {:?}", conn.trace_id(), e);
+                    return;
+                },
+            };
+
+            resp.body.drain(..written);
+        }
+
+        // TODO make an upstream bufer or write to partial directly?
+        let mut buf = [0; 10240];
+
+        if let Some(upstream) = self.upstreams.get_mut(&stream_id) {
+            let timeout = Some(std::time::Duration::from_millis(1));
+            upstream.poll.poll(&mut upstream.events, timeout).unwrap();
+
+            if upstream.events.is_empty() {
+                // Nothing happened to our TCP socket so just exit now.
+                return;
+            }
+
+            if let Some(tcp) = &mut upstream.tcp_stream {
+                trace!("Reading from target TCP socket");
+                match tcp.read(&mut buf) {
+                    Ok(0) => {
+                        // TODO: if the upstream closes connection, we should
+                        // reset the stream.
+                        error!("Target connection closed, deal with it!");
+                    },
+
+                    Ok(len) => {
+                        trace!(
+                            "Read {} bytes from target server: {:?}",
+                            len,
+                            buf[..len].to_vec()
+                        );
+
+                        let resp = partial_responses.get_mut(&stream_id).unwrap();
+                        resp.body.extend_from_slice(&buf[..len]);
+                    },
+
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            error!("Target server read() would block");
+                            return;
+                        }
+
+                        // TODO: handle error by removing the upstream and
+                        // closing the request stream
+                        error!("read() failed: {:?}", e);
+                        self.closed_upstreams.push(stream_id);
+                    },
+                }
+            }
+        }
+
+        for id in self.closed_upstreams.drain(..) {
+            self.upstreams.remove(&id);
+        }
+    }
+}

@@ -35,39 +35,11 @@ use std::collections::HashMap;
 
 use ring::rand::*;
 
-use quiche_apps::*;
+use quiche_apps::args::*;
+use quiche_apps::common::*;
+use quiche_apps::masque::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-
-const USAGE: &str = "Usage:
-  quiche-server [options]
-  quiche-server -h | --help
-
-Options:
-  --listen <addr>             Listen on the given IP:port [default: 127.0.0.1:4433]
-  --cert <file>               TLS certificate path [default: src/bin/cert.crt]
-  --key <file>                TLS certificate key path [default: src/bin/cert.key]
-  --root <dir>                Root directory [default: src/bin/root/]
-  --index <name>              The file that will be used as index [default: index.html].
-  --name <str>                Name of the server [default: quic.tech]
-  --max-data BYTES            Connection-wide flow control limit [default: 10000000].
-  --max-stream-data BYTES     Per-stream flow control limit [default: 1000000].
-  --max-streams-bidi STREAMS  Number of allowed concurrent streams [default: 100].
-  --max-streams-uni STREAMS   Number of allowed concurrent streams [default: 100].
-  --idle-timeout TIMEOUT   Idle timeout in milliseconds [default: 30000].
-  --dump-packets PATH         Dump the incoming packets as files in the given directory.
-  --early-data                Enables receiving early data.
-  --no-retry                  Disable stateless retry.
-  --no-grease                 Don't send GREASE.
-  --http-version VERSION      HTTP version to use [default: all].
-  --dgram-proto PROTO         DATAGRAM application protocol to use [default: none].
-  --dgram-count COUNT         Number of DATAGRAMs to send [default: 0].
-  --dgram-data DATA           Data to send for certain types of DATAGRAM application protocol [default: brrr].
-  --masque                    Enable MASQUE proxy mode.
-  --cc-algorithm NAME         Specify which congestion control algorithm to use [default: cubic].
-  --disable-hystart           Disable HyStart++.
-  -h --help                   Show this screen.
-";
 
 fn main() {
     let mut buf = [0; 65535];
@@ -78,7 +50,7 @@ fn main() {
         .init();
 
     // Parse CLI parameters.
-    let docopt = docopt::Docopt::new(USAGE).unwrap();
+    let docopt = docopt::Docopt::new(SERVER_USAGE).unwrap();
     let conn_args = CommonArgs::with_docopt(&docopt);
     let args = ServerArgs::with_docopt(&docopt);
 
@@ -207,7 +179,7 @@ fn main() {
         // clients.values().filter_map(|(_, c)| c.conn.timeout()).min();
 
         let timeout = if args.masque {
-            Some(std::time::Duration::from_millis(100))
+            Some(std::time::Duration::from_millis(1))
         } else {
             clients.values().filter_map(|(_, c)| c.conn.timeout()).min()
         };
@@ -401,6 +373,10 @@ fn main() {
                     partial_responses: HashMap::new(),
                     siduck_conn: None,
                     app_proto_selected: false,
+                    proxy_type: ProxyType::Direct,
+                    args: None,
+                    conn_args: None,
+                    start_time: std::time::Instant::now(),
                 };
 
                 clients.insert(scid.to_vec(), (src, client));
@@ -622,42 +598,4 @@ fn validate_token<'a>(
     let token = &token[addr.len()..];
 
     Some(&token[..])
-}
-
-// Application-specific arguments that compliment the `CommonArgs`.
-struct ServerArgs {
-    listen: String,
-    no_retry: bool,
-    root: String,
-    index: String,
-    cert: String,
-    key: String,
-    early_data: bool,
-    masque: bool,
-}
-
-impl Args for ServerArgs {
-    fn with_docopt(docopt: &docopt::Docopt) -> Self {
-        let args = docopt.parse().unwrap_or_else(|e| e.exit());
-
-        let listen = args.get_str("--listen").to_string();
-        let no_retry = args.get_bool("--no-retry");
-        let early_data = args.get_bool("--early-data");
-        let root = args.get_str("--root").to_string();
-        let index = args.get_str("--index").to_string();
-        let cert = args.get_str("--cert").to_string();
-        let key = args.get_str("--key").to_string();
-        let masque = args.get_bool("--masque");
-
-        ServerArgs {
-            listen,
-            no_retry,
-            root,
-            index,
-            cert,
-            key,
-            early_data,
-            masque,
-        }
-    }
 }
