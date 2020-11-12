@@ -280,6 +280,7 @@ Options:
   --dgram-count COUNT         Number of DATAGRAMs to send [default: 0].
   --dgram-data DATA           Data to send for certain types of DATAGRAM application protocol [default: brrr].
   --masque                    Enable MASQUE proxy mode.
+  --masque-secret <str>       Secret required to be sent by MASQUE clients.
   --cc-algorithm NAME         Specify which congestion control algorithm to use [default: cubic].
   --disable-hystart           Disable HyStart++.
   -h --help                   Show this screen.
@@ -295,6 +296,7 @@ pub struct ServerArgs {
     pub key: String,
     pub early_data: bool,
     pub masque: bool,
+    pub masque_secret: Option<String>,
 }
 
 impl Args for ServerArgs {
@@ -309,6 +311,11 @@ impl Args for ServerArgs {
         let cert = args.get_str("--cert").to_string();
         let key = args.get_str("--key").to_string();
         let masque = args.get_bool("--masque");
+        let masque_secret = if args.get_str("--masque-secret") != "" {
+            Some(args.get_str("--masque-secret").to_string())
+        } else {
+            None
+        };
 
         ServerArgs {
             listen,
@@ -319,6 +326,7 @@ impl Args for ServerArgs {
             key,
             early_data,
             masque,
+            masque_secret,
         }
     }
 }

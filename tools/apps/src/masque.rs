@@ -69,12 +69,13 @@ pub fn get_proxy_type() -> ProxyType {
 
 fn validate_tunnel_request(
     request: &[quiche::h3::Header], stream_id: u64,
-) -> quiche::h3::Result<(ProxyType, u64)> {
+) -> std::result::Result<(ProxyType, u64), u32> {
     let mut scheme = None;
     let mut host = None;
     let mut path = None;
     let mut method = None;
     let mut dgram_flow_id = None;
+    let mut masque_secret = None;
 
     for hdr in request {
         match hdr.name() {
@@ -98,16 +99,31 @@ fn validate_tunnel_request(
                 dgram_flow_id = Some(hdr.value());
             },
 
+            "masque-secret" => {
+                masque_secret = Some(hdr.value().to_string());
+            },
+
             _ => (),
         }
     }
 
     if scheme.is_some() || path.is_some() {
         error!("malformed CONNECT request: scheme or path is present");
-        return Err(quiche::h3::Error::Done);
+        return Err(400);
     }
 
     // TODO validate host
+    let docopt = docopt::Docopt::new(SERVER_USAGE).unwrap();
+    let args = ServerArgs::with_docopt(&docopt);
+
+    // Validate MASQUE secret.
+    if args.masque_secret.is_some() && masque_secret != args.masque_secret {
+        error!(
+            "rejected CONNECT request: secret {:?} does not match",
+            masque_secret
+        );
+        return Err(400);
+    }
 
     let (proxy_type, id) = match method {
         Some("CONNECT") => (ProxyType::Http(host.unwrap()), stream_id),
@@ -124,7 +140,7 @@ fn validate_tunnel_request(
                             "malformed CONNECT-UDP request: {}",
                             e.to_string()
                         );
-                        return Err(quiche::h3::Error::Done);
+                        return Err(400);
                     },
                 },
 
@@ -132,13 +148,13 @@ fn validate_tunnel_request(
                     error!(
                         "malformed CONNECT-UDP request: datagram-flow-id missing"
                     );
-                    return Err(quiche::h3::Error::Done);
+                    return Err(400);
                 },
             }
         },
 
         _ => {
-            return Err(quiche::h3::Error::Done);
+            return Err(400);
         },
     };
 
@@ -176,7 +192,8 @@ pub type ContextMap = HashMap<String, ConnectContext>;
 pub struct MasqueConn {
     h3_conn: quiche::h3::Connection,
     reqs_sent: usize,
-    _reqs_complete: usize,
+    reqs_complete: usize,
+    reqs_failed: usize,
     client_view: ContextMap,
     _body: Option<Vec<u8>>,
     upstreams: HashMap<u64, Upstream>,
@@ -316,7 +333,8 @@ impl MasqueConn {
             h3_conn: quiche::h3::Connection::with_transport(conn, &config)
                 .unwrap(),
             reqs_sent: 0,
-            _reqs_complete: 0,
+            reqs_complete: 0,
+            reqs_failed: 0,
             client_view,
 
             _body: body.as_ref().map(|b| b.to_vec()),
@@ -338,7 +356,8 @@ impl MasqueConn {
             h3_conn: quiche::h3::Connection::with_transport(conn, &config)
                 .unwrap(),
             reqs_sent: 0,
-            _reqs_complete: 0,
+            reqs_complete: 0,
+            reqs_failed: 0,
             client_view: HashMap::new(),
             _body: None,
             upstreams: HashMap::new(),
@@ -489,6 +508,31 @@ impl HttpConn for MasqueConn {
                         "got response headers {:?} on stream id {}",
                         list, stream_id
                     );
+
+                    let mut status = None;
+
+                    for hdr in list {
+                        match hdr.name() {
+                            ":status" => {
+                                status =
+                                    hdr.value().to_string().parse::<u32>().ok();
+                            },
+
+                            _ => (),
+                        }
+                    }
+
+                    // TODO: this is a bit of a shortcut
+                    match status {
+                        Some(v) =>
+                            if v != 200 {
+                                self.reqs_failed += 1;
+                            },
+
+                        None => {
+                            self.reqs_failed += 1;
+                        },
+                    }
                 },
 
                 Ok((stream_id, quiche::h3::Event::Data)) => {
@@ -528,20 +572,21 @@ impl HttpConn for MasqueConn {
                     }
                 },
 
-                Ok((_stream_id, quiche::h3::Event::Finished)) => {
+                Ok((stream_id, quiche::h3::Event::Finished)) => {
+                    debug!("got finished {}", stream_id);
                     // TODO: properly detect end of connect and tunneled requests.
 
-                    /*self.reqs_complete += 1;
-                    let reqs_count = self.connect_reqs.len();
+                    self.reqs_complete += 1;
+                    let reqs_count = self.client_view.len();
 
                     debug!(
-                        "{}/{} responses received",
-                        self.reqs_complete, reqs_count
+                        "{}/{} CONNECT streams completed, {} failed",
+                        self.reqs_complete, reqs_count, self.reqs_failed
                     );
 
                     if self.reqs_complete == reqs_count {
                         info!(
-                            "{}/{} response(s) received in {:?}, closing...",
+                            "{}/{} CONNECT streams completed {:?}, closing...",
                             self.reqs_complete,
                             reqs_count,
                             req_start.elapsed()
@@ -555,7 +600,7 @@ impl HttpConn for MasqueConn {
                         }
 
                         break;
-                    }*/
+                    }
                 },
 
                 Ok((_flow_id, quiche::h3::Event::Datagram)) => {
@@ -633,6 +678,11 @@ impl HttpConn for MasqueConn {
     }
 
     fn is_complete(&self) -> bool {
+        // CONNECT requests have all been tidied up. Could be a failure case.
+        if self.reqs_sent == self.reqs_complete {
+            return true;
+        }
+
         let mut inner_complete = true;
 
         for (_, client) in &self.client_view {
@@ -661,6 +711,8 @@ impl HttpConn for MasqueConn {
             }
         }
 
+        // Did we send all the CONNECT requests that we wanted and have all the
+        // inner connections make all the requests they wanted?
         self.reqs_sent == self.client_view.len() && inner_complete
     }
 
@@ -799,7 +851,32 @@ impl HttpConn for MasqueConn {
                     );
 
                     let (proxy_type, upstream_key) =
-                        validate_tunnel_request(&list, stream_id)?;
+                        match validate_tunnel_request(&list, stream_id) {
+                            Ok(v) => v,
+
+                            Err(code) => {
+                                let headers = Some(vec![
+                                    quiche::h3::Header::new(
+                                        ":status",
+                                        &code.to_string(),
+                                    ),
+                                    quiche::h3::Header::new(
+                                        "server",
+                                        "quiche-masque",
+                                    ),
+                                ]);
+
+                                let response = PartialResponse {
+                                    headers,
+                                    body: Vec::new(),
+                                    written: 0,
+                                    fin: true,
+                                };
+
+                                partial_responses.insert(stream_id, response);
+                                continue;
+                            },
+                        };
 
                     // Make the upstream connection.
                     let res = match proxy_type {
@@ -1122,7 +1199,10 @@ impl HttpConn for MasqueConn {
 
         if let Some(ref headers) = resp.headers {
             trace!("writing CONNECT response headers");
-            match self.h3_conn.send_response(conn, stream_id, &headers, false) {
+            match self
+                .h3_conn
+                .send_response(conn, stream_id, &headers, resp.fin)
+            {
                 Ok(_) => (),
 
                 Err(quiche::h3::Error::StreamBlocked) => {
@@ -1149,7 +1229,7 @@ impl HttpConn for MasqueConn {
 
             let written = match self
                 .h3_conn
-                .send_body(conn, stream_id, &resp.body, false)
+                .send_body(conn, stream_id, &resp.body, resp.fin)
             {
                 Ok(v) => v,
 
