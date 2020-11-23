@@ -281,6 +281,7 @@ Options:
   --dgram-data DATA           Data to send for certain types of DATAGRAM application protocol [default: brrr].
   --masque                    Enable MASQUE proxy mode.
   --masque-secret <str>       Secret required to be sent by MASQUE clients.
+  --no-verify                 Don't verify server's certificate. (Only when connecting to proxy).
   --cc-algorithm NAME         Specify which congestion control algorithm to use [default: cubic].
   --disable-hystart           Disable HyStart++.
   -h --help                   Show this screen.
@@ -297,6 +298,7 @@ pub struct ServerArgs {
     pub early_data: bool,
     pub masque: bool,
     pub masque_secret: Option<String>,
+    pub no_verify: bool,
 }
 
 impl Args for ServerArgs {
@@ -316,6 +318,7 @@ impl Args for ServerArgs {
         } else {
             None
         };
+        let no_verify = args.get_bool("--no-verify");
 
         ServerArgs {
             listen,
@@ -327,6 +330,7 @@ impl Args for ServerArgs {
             early_data,
             masque,
             masque_secret,
+            no_verify,
         }
     }
 }
