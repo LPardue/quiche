@@ -750,130 +750,101 @@ impl MasqueConn {
             }
         }
 
-        match udp.recv(buf) {
-            Ok(len) => {
-                trace!(
-                    "read {} UDP bytes from target of flow {}: {:?}",
-                    len,
-                    id,
-                    buf[..len].to_vec()
-                );
+        // read *all* upstream UDP datagrams until the socket says otherwise.
+        loop {
+            match udp.recv(buf) {
+                Ok(len) => {
+                    trace!(
+                        "read {} UDP bytes from target of flow {}: {:?}",
+                        len,
+                        id,
+                        buf[..len].to_vec()
+                    );
 
-                // When running in normal MASQUE mode, simply send the UDP
-                // payload back to the client as HTTP/3 DATAGRAM.
-                if upstream.masque_relay.is_none() {
-                    match self.h3_conn.send_dgram(conn, id, &buf[..len]) {
+                    // When running in normal MASQUE mode, simply send the UDP
+                    // payload back to the client as HTTP/3 DATAGRAM.
+                    if upstream.masque_relay.is_none() {
+                        match self.h3_conn.send_dgram(conn, id, &buf[..len]) {
+                            Ok(v) => v,
+
+                            Err(e) => {
+                                error!("failed to send dgram {:?}", e);
+                                return;
+                            },
+                        }
+                    }
+
+                    // If we're a relay, the inbound `udp` is from the next hop so
+                    // it needs to be decapsulated before sending to the client
+                    // `self.h3_conn`.
+                    let relay = match upstream.masque_relay.as_mut() {
+                        Some(v) => v,
+
+                        None => continue,
+                    };
+
+                    // Process relay's received QUIC packets from next hop.
+                    match relay.conn.recv(&mut buf[..len]) {
                         Ok(v) => v,
 
                         Err(e) => {
-                            error!("failed to send dgram {:?}", e);
+                            // This is a pretty bad, the relay failed to
+                            // communicate
+                            // with the next hop for some reason. Tear everything
+                            // down.
+                            error!("relay quiche recv() failed: {:?}", e);
+
+                            relay.conn.close(false, 0x1, b"fail").ok();
+                            self.h3_conn.send_body(conn, 0, &buf[..0], true).ok();
+                            conn.close(false, 0x1, b"fail").ok();
+                            return;
                         },
+                    };
+
+                    // Once handshake is complete, make the relay's HTTP/3 conn.
+                    if relay.conn.is_established() && relay.h3_conn.is_none() {
+                        let app_proto = relay.conn.application_proto();
+                        let app_proto = &std::str::from_utf8(&app_proto).unwrap();
+
+                        if alpns::HTTP_3.contains(app_proto) {
+                            let mut config = quiche::h3::Config::new().unwrap();
+                            config.set_dgram_poll_threshold(1);
+                            config.set_stream_poll_threshold(1);
+                            relay.h3_conn = Some(
+                                quiche::h3::Connection::with_transport(
+                                    &mut relay.conn,
+                                    &config,
+                                )
+                                .unwrap(),
+                            );
+                        } else {
+                            unreachable!();
+                        }
                     }
 
-                    return;
-                }
+                    // Process the relay's received HTTP/3 data from the next hop.
+                    let relay_h3_conn = match relay.h3_conn.as_mut() {
+                        Some(v) => v,
 
-                // If we're a relay, the inbound `udp` is from the next hop so
-                // it needs to be decapsulated before sending to the client
-                // `self.h3_conn`.
-                let relay = match upstream.masque_relay.as_mut() {
-                    Some(v) => v,
+                        None => return,
+                    };
 
-                    None => return,
-                };
-
-                // Process relay's received QUIC packets from next hop.
-                match relay.conn.recv(&mut buf[..len]) {
-                    Ok(v) => v,
-
-                    Err(e) => {
-                        // This is a pretty bad, the relay failed to communicate
-                        // with the next hop for some reason. Tear everything
-                        // down.
-                        error!("relay quiche recv() failed: {:?}", e);
-
-                        relay.conn.close(false, 0x1, b"fail").ok();
-                        self.h3_conn.send_body(conn, 0, &buf[..0], true).ok();
-                        conn.close(false, 0x1, b"fail").ok();
-                        return;
-                    },
-                };
-
-                // Once handshake is complete, make the relay's HTTP/3 conn.
-                if relay.conn.is_established() && relay.h3_conn.is_none() {
-                    let app_proto = relay.conn.application_proto();
-                    let app_proto = &std::str::from_utf8(&app_proto).unwrap();
-
-                    if alpns::HTTP_3.contains(app_proto) {
-                        let mut config = quiche::h3::Config::new().unwrap();
-                        config.set_dgram_poll_threshold(1);
-                        config.set_stream_poll_threshold(1);
-                        relay.h3_conn = Some(
-                            quiche::h3::Connection::with_transport(
-                                &mut relay.conn,
-                                &config,
-                            )
-                            .unwrap(),
-                        );
-                    } else {
-                        unreachable!();
-                    }
-                }
-
-                // Process the relay's received HTTP/3 data from the next hop.
-                let relay_h3_conn = match relay.h3_conn.as_mut() {
-                    Some(v) => v,
-
-                    None => return,
-                };
-
-                loop {
-                    match relay_h3_conn.poll(&mut relay.conn) {
-                        Ok((
-                            stream_id,
-                            quiche::h3::Event::Headers { list, has_body },
-                        )) => {
-                            trace!(
+                    loop {
+                        match relay_h3_conn.poll(&mut relay.conn) {
+                            Ok((
+                                stream_id,
+                                quiche::h3::Event::Headers { list, has_body },
+                            )) => {
+                                trace!(
                                 "{} relay got response headers {:?} on stream id {}",
                                 relay.conn.trace_id(), list, stream_id
                             );
 
-                            // Forward the received headers.
-                            match self
-                                .h3_conn
-                                .send_response(conn, stream_id, &list, !has_body)
-                            {
-                                Ok(v) => v,
-
-                                Err(e) => {
-                                    error!(
-                                        "{} relay stream send failed {:?}",
-                                        conn.trace_id(),
-                                        e
-                                    );
-                                },
-                            }
-                        },
-
-                        Ok((stream_id, quiche::h3::Event::Data)) => {
-                            if let Ok(read) = relay_h3_conn.recv_body(
-                                &mut relay.conn,
-                                stream_id,
-                                buf,
-                            ) {
-                                trace!(
-                                    "relay got {} bytes of response data on stream {}",
-                                    read, stream_id
-                                );
-
-                                // Forward received data.
-                                match self.h3_conn.send_body(
-                                    conn,
-                                    stream_id,
-                                    &buf[..read],
-                                    false,
+                                // Forward the received headers.
+                                match self.h3_conn.send_response(
+                                    conn, stream_id, &list, !has_body,
                                 ) {
-                                    Ok(_v) => (),
+                                    Ok(v) => v,
 
                                     Err(e) => {
                                         error!(
@@ -883,94 +854,125 @@ impl MasqueConn {
                                         );
                                     },
                                 }
-                            }
-                        },
+                            },
 
-                        Ok((stream_id, quiche::h3::Event::Finished)) => {
-                            // The upstream finished the
-                            // stream, emulate with a
-                            // 0-length fin.
-                            match self.h3_conn.send_body(
-                                conn,
-                                stream_id,
-                                &buf[..0],
-                                true,
-                            ) {
-                                Ok(_v) => (),
+                            Ok((stream_id, quiche::h3::Event::Data)) => {
+                                if let Ok(read) = relay_h3_conn.recv_body(
+                                    &mut relay.conn,
+                                    stream_id,
+                                    buf,
+                                ) {
+                                    trace!(
+                                    "relay got {} bytes of response data on stream {}",
+                                    read, stream_id
+                                );
 
-                                Err(e) => {
-                                    error!(
-                                        "{} stream send failed {:?}",
-                                        relay.conn.trace_id(),
-                                        e
-                                    );
-                                },
-                            }
-                        },
+                                    // Forward received data.
+                                    match self.h3_conn.send_body(
+                                        conn,
+                                        stream_id,
+                                        &buf[..read],
+                                        false,
+                                    ) {
+                                        Ok(_v) => (),
 
-                        Ok((_flow_id, quiche::h3::Event::Datagram)) => {
-                            let (len, flow_id, flow_id_len) = relay_h3_conn
-                                .recv_dgram(&mut relay.conn, buf)
-                                .unwrap();
+                                        Err(e) => {
+                                            error!(
+                                            "{} relay stream send failed {:?}",
+                                            conn.trace_id(),
+                                            e
+                                        );
+                                        },
+                                    }
+                                }
+                            },
 
-                            debug!(
-                                "Received DATAGRAM flow_id={} len={}",
-                                flow_id, len,
-                            );
+                            Ok((stream_id, quiche::h3::Event::Finished)) => {
+                                // The upstream finished the
+                                // stream, emulate with a
+                                // 0-length fin.
+                                match self.h3_conn.send_body(
+                                    conn,
+                                    stream_id,
+                                    &buf[..0],
+                                    true,
+                                ) {
+                                    Ok(_v) => (),
 
-                            match self.h3_conn.send_dgram(
-                                conn,
-                                id,
-                                &buf[flow_id_len..len],
-                            ) {
-                                Ok(v) => v,
+                                    Err(e) => {
+                                        error!(
+                                            "{} stream send failed {:?}",
+                                            relay.conn.trace_id(),
+                                            e
+                                        );
+                                    },
+                                }
+                            },
 
-                                Err(e) => {
-                                    error!("failed to send dgram {:?}", e);
-                                    break;
-                                },
-                            }
-                        },
+                            Ok((_flow_id, quiche::h3::Event::Datagram)) => {
+                                let (len, flow_id, flow_id_len) = relay_h3_conn
+                                    .recv_dgram(&mut relay.conn, buf)
+                                    .unwrap();
 
-                        Ok((goaway_id, quiche::h3::Event::GoAway)) => {
-                            info!(
-                                "{} got GOAWAY with ID {} ",
-                                relay.conn.trace_id(),
-                                goaway_id
-                            );
-                        },
+                                debug!(
+                                    "Received DATAGRAM flow_id={} len={}",
+                                    flow_id, len,
+                                );
 
-                        Err(quiche::h3::Error::Done) => {
-                            break;
-                        },
+                                match self.h3_conn.send_dgram(
+                                    conn,
+                                    id,
+                                    &buf[flow_id_len..len],
+                                ) {
+                                    Ok(v) => v,
 
-                        Err(e) => {
-                            error!("HTTP/3 processing failed: {:?}", e);
+                                    Err(e) => {
+                                        error!("failed to send dgram {:?}", e);
+                                        break;
+                                    },
+                                }
+                            },
 
-                            break;
-                        },
+                            Ok((goaway_id, quiche::h3::Event::GoAway)) => {
+                                info!(
+                                    "{} got GOAWAY with ID {} ",
+                                    relay.conn.trace_id(),
+                                    goaway_id
+                                );
+                            },
+
+                            Err(quiche::h3::Error::Done) => {
+                                break;
+                            },
+
+                            Err(e) => {
+                                error!("HTTP/3 processing failed: {:?}", e);
+
+                                break;
+                            },
+                        }
                     }
-                }
 
-                if relay.conn.is_closed() {
-                    error!(
-                        "Relay connection connection closed, {:?}",
-                        relay.conn.stats()
-                    );
-                }
-            },
+                    if relay.conn.is_closed() {
+                        error!(
+                            "Relay connection connection closed, {:?}",
+                            relay.conn.stats()
+                        );
+                    }
+                },
 
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    // trace!("recv() would block");
-                    return;
-                }
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        // trace!("recv() would block");
+                        return;
+                    }
 
-                // TODO: handle error by removing the upstream and
-                // closing the request stream
-                error!("read() failed: {:?}", e);
-                self.closed_upstreams.push(id);
-            },
+                    // TODO: handle error by removing the upstream and
+                    // closing the request stream
+                    error!("read() failed: {:?}", e);
+                    self.closed_upstreams.push(id);
+                },
+            }
         }
     }
 }
