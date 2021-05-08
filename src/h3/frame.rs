@@ -35,14 +35,59 @@ pub const SETTINGS_FRAME_TYPE_ID: u64 = 0x4;
 pub const PUSH_PROMISE_FRAME_TYPE_ID: u64 = 0x5;
 pub const GOAWAY_FRAME_TYPE_ID: u64 = 0x6;
 pub const MAX_PUSH_FRAME_TYPE_ID: u64 = 0xD;
+pub const CAPSULE_FRAME_TYPE_ID: u64 = 0xffcab5;
 
 const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x1;
 const SETTINGS_MAX_HEADER_LIST_SIZE: u64 = 0x6;
 const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x7;
-const SETTINGS_H3_DATAGRAM: u64 = 0x276;
+const SETTINGS_H3_DATAGRAM: u64 = 0xffd276;
 
 // Permit between 16 maximally-encoded and 128 minimally-encoded SETTINGS.
 const MAX_SETTINGS_PAYLOAD_SIZE: usize = 256;
+
+pub const CAPSULE_REGISTER_DATAGRAM_CONTEXT_TYPE_ID: u64 = 0x0;
+pub const CAPSULE_CLOSE_DATAGRAM_CONTEXT_TYPE_ID: u64 = 0x1;
+pub const CAPSULE_DATAGRAM_TYPE_ID: u64 = 0x2;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CapsuleData {
+    RegisterDatagramContext {
+        context_id: u64,
+        extension_string: Vec<u8>,
+    },
+
+    CloseDatagramContext {
+        context_id: u64,
+    },
+
+    Datagram {
+        context_id: u64,
+        payload: Vec<u8>,
+    },
+
+    Unknown,
+}
+
+impl CapsuleData {
+    pub fn wire_length(&self) -> usize {
+        match self {
+            CapsuleData::RegisterDatagramContext {
+                context_id,
+                extension_string,
+            } => octets::varint_len(*context_id) + extension_string.len(),
+
+            CapsuleData::CloseDatagramContext { context_id } =>
+                octets::varint_len(*context_id),
+
+            CapsuleData::Datagram {
+                context_id,
+                payload,
+            } => octets::varint_len(*context_id) + payload.len(),
+
+            CapsuleData::Unknown => unreachable!(),
+        }
+    }
+}
 
 #[derive(Clone, PartialEq)]
 pub enum Frame {
@@ -77,6 +122,11 @@ pub enum Frame {
 
     MaxPushId {
         push_id: u64,
+    },
+
+    Capsule {
+        capsule_type: u64,
+        capsule_data: CapsuleData,
     },
 
     Unknown,
@@ -115,6 +165,9 @@ impl Frame {
             MAX_PUSH_FRAME_TYPE_ID => Frame::MaxPushId {
                 push_id: b.get_varint()?,
             },
+
+            CAPSULE_FRAME_TYPE_ID =>
+                parse_capsule_frame(&mut b, payload_length as usize)?,
 
             _ => Frame::Unknown,
         };
@@ -236,6 +289,42 @@ impl Frame {
                 b.put_varint(*push_id)?;
             },
 
+            Frame::Capsule {
+                capsule_type,
+                capsule_data,
+            } => {
+                b.put_varint(CAPSULE_FRAME_TYPE_ID)?;
+                b.put_varint(
+                    octets::varint_len(*capsule_type) as u64 +
+                        capsule_data.wire_length() as u64,
+                )?;
+                b.put_varint(*capsule_type)?;
+
+                match capsule_data {
+                    CapsuleData::RegisterDatagramContext {
+                        context_id,
+                        extension_string,
+                    } => {
+                        b.put_varint(*context_id)?;
+                        b.put_bytes(extension_string)?;
+                    },
+
+                    CapsuleData::CloseDatagramContext { context_id } => {
+                        b.put_varint(*context_id)?;
+                    },
+
+                    CapsuleData::Datagram {
+                        context_id,
+                        payload,
+                    } => {
+                        b.put_varint(*context_id)?;
+                        b.put_bytes(payload)?;
+                    },
+
+                    _ => unreachable!(),
+                }
+            },
+
             Frame::Unknown => unreachable!(),
         }
 
@@ -287,6 +376,10 @@ impl std::fmt::Debug for Frame {
                 write!(f, "MAX_PUSH_ID push_id={}", push_id)?;
             },
 
+            Frame::Capsule { capsule_type, .. } => {
+                write!(f, "CAPSULE capsule type={}", capsule_type)?;
+            },
+
             Frame::Unknown => {
                 write!(f, "UNKNOWN")?;
             },
@@ -294,6 +387,37 @@ impl std::fmt::Debug for Frame {
 
         Ok(())
     }
+}
+
+fn parse_capsule_frame(
+    b: &mut octets::Octets, capsule_length: usize,
+) -> Result<Frame> {
+    let capsule_type = b.get_varint()?;
+
+    let capsule_data = match capsule_type {
+        CAPSULE_REGISTER_DATAGRAM_CONTEXT_TYPE_ID =>
+            CapsuleData::RegisterDatagramContext {
+                context_id: b.get_varint()?,
+                extension_string: b.get_bytes(capsule_length - b.off())?.to_vec(),
+            },
+
+        CAPSULE_CLOSE_DATAGRAM_CONTEXT_TYPE_ID =>
+            CapsuleData::CloseDatagramContext {
+                context_id: b.get_varint()?,
+            },
+
+        CAPSULE_DATAGRAM_TYPE_ID => CapsuleData::Datagram {
+            context_id: b.get_varint()?,
+            payload: b.get_bytes(capsule_length - b.off())?.to_vec(),
+        },
+
+        _ => CapsuleData::Unknown,
+    };
+
+    Ok(Frame::Capsule {
+        capsule_type,
+        capsule_data,
+    })
 }
 
 fn parse_settings_frame(
@@ -464,7 +588,7 @@ mod tests {
             grease: None,
         };
 
-        let frame_payload_len = 9;
+        let frame_payload_len = 11;
         let frame_header_len = 2;
 
         let wire_len = {
@@ -506,7 +630,7 @@ mod tests {
             grease: None,
         };
 
-        let frame_payload_len = 11;
+        let frame_payload_len = 13;
         let frame_header_len = 2;
 
         let wire_len = {
@@ -572,7 +696,7 @@ mod tests {
             grease: None,
         };
 
-        let frame_payload_len = 3;
+        let frame_payload_len = 5;
         let frame_header_len = 2;
 
         let wire_len = {
@@ -605,7 +729,7 @@ mod tests {
             grease: None,
         };
 
-        let frame_payload_len = 3;
+        let frame_payload_len = 5;
         let frame_header_len = 2;
 
         let wire_len = {
@@ -841,5 +965,72 @@ mod tests {
         let d = [42; 12];
 
         assert_eq!(Frame::from_bytes(255, 12345, &d[..]), Ok(Frame::Unknown));
+    }
+
+    #[test]
+    fn capsule() {
+        let mut d = [42; 128];
+
+        let data = "foo=bar".as_bytes().to_vec();
+
+        let frame_header_len = 5;
+
+        let frame = Frame::Capsule {
+            capsule_type: CAPSULE_REGISTER_DATAGRAM_CONTEXT_TYPE_ID,
+            capsule_data: CapsuleData::RegisterDatagramContext {
+                context_id: 0,
+                extension_string: data.clone(),
+            },
+        };
+
+        let frame_payload_len = 2 + data.len();
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, frame_header_len + frame_payload_len);
+
+        assert_eq!(
+            Frame::from_bytes(
+                CAPSULE_FRAME_TYPE_ID,
+                frame_payload_len as u64,
+                &d[frame_header_len..]
+            )
+            .unwrap(),
+            frame
+        );
+
+        let frame = Frame::Capsule {
+            capsule_type: CAPSULE_CLOSE_DATAGRAM_CONTEXT_TYPE_ID,
+            capsule_data: CapsuleData::CloseDatagramContext { context_id: 0 },
+        };
+
+        let frame_payload_len = 2;
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, frame_header_len + frame_payload_len);
+
+        let frame = Frame::Capsule {
+            capsule_type: CAPSULE_DATAGRAM_TYPE_ID,
+            capsule_data: CapsuleData::Datagram {
+                context_id: 0,
+                payload: data.clone(),
+            },
+        };
+
+        let frame_payload_len = 2 + data.len();
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, frame_header_len + frame_payload_len);
     }
 }

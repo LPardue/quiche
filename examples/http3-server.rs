@@ -361,6 +361,8 @@ fn main() {
 
                         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
 
+                        Ok((_stream_id, quiche::h3::Event::Capsule { .. })) => (),
+
                         Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
 
                         Err(quiche::h3::Error::Done) => {

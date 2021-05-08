@@ -1192,6 +1192,16 @@ impl HttpConn for Http3Conn {
                     }
                 },
 
+                Ok((stream_id, quiche::h3::Event::Capsule { ty, data })) => {
+                    info!(
+                        "{} Received CAPSULE stream_id={} type={} data={:?} ",
+                        conn.trace_id(),
+                        stream_id,
+                        ty,
+                        data
+                    );
+                },
+
                 Ok((goaway_id, quiche::h3::Event::GoAway)) => {
                     info!(
                         "{} got GOAWAY with ID {} ",
@@ -1340,6 +1350,16 @@ impl HttpConn for Http3Conn {
                             buf[flow_id_len..len].to_vec()
                         );
                     }
+                },
+
+                Ok((stream_id, quiche::h3::Event::Capsule { ty, data })) => {
+                    info!(
+                        "{} Received CAPSULE stream_id={} type={} data={:?} ",
+                        conn.trace_id(),
+                        stream_id,
+                        ty,
+                        data
+                    );
                 },
 
                 Ok((goaway_id, quiche::h3::Event::GoAway)) => {

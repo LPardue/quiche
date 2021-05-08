@@ -263,6 +263,8 @@ fn main() {
 
                     Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
 
+                    Ok((_stream_id, quiche::h3::Event::Capsule { .. })) => (),
+
                     Ok((goaway_id, quiche::h3::Event::GoAway)) => {
                         info!("GOAWAY id={}", goaway_id);
                     },

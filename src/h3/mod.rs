@@ -162,6 +162,8 @@
 //!
 //!         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
 //!
+//!         Ok((_stream_id, quiche::h3::Event::Capsule{..})) => (),
+//!
 //!         Ok((goaway_id, quiche::h3::Event::GoAway)) => {
 //!              // Peer signalled it is going away, handle it.
 //!         },
@@ -216,6 +218,8 @@
 //!
 //!         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
 //!
+//!         Ok((_stream_id, quiche::h3::Event::Capsule{..})) => (),
+//!
 //!         Ok((goaway_id, quiche::h3::Event::GoAway)) => {
 //!              // Peer signalled it is going away, handle it.
 //!         },
@@ -267,6 +271,8 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 
 use crate::octets;
+
+use self::frame::CapsuleData;
 
 /// List of ALPN tokens of supported HTTP/3 versions.
 ///
@@ -580,6 +586,15 @@ pub enum Event {
     /// [`recv_dgram()`]: struct.Connection.html#method.recv_dgram
     /// [`Done`]: enum.Error.html#variant.Done
     Datagram,
+
+    /// CAPSULE frame.
+    Capsule {
+        /// CAPSULE frame type
+        ty: u64,
+
+        /// CAPSULE frame data.
+        data: CapsuleData,
+    },
 
     /// GOAWAY was received.
     GoAway,
@@ -1372,6 +1387,82 @@ impl Connection {
         Ok(())
     }
 
+    /// LP TODO
+    pub fn send_capsule(
+        &mut self, conn: &mut super::Connection, stream_id: u64,
+        capsule_data: CapsuleData,
+    ) -> Result<()> {
+        // Validate that it is sane to send data on the stream.
+        if stream_id % 4 != 0 {
+            return Err(Error::FrameUnexpected);
+        }
+
+        match self.streams.get(&stream_id) {
+            Some(s) =>
+                if !s.local_initialized() {
+                    return Err(Error::FrameUnexpected);
+                },
+
+            None => {
+                return Err(Error::FrameUnexpected);
+            },
+        };
+
+        let capsule_data_wire_len = capsule_data.wire_length();
+
+        let overhead = octets::varint_len(frame::CAPSULE_FRAME_TYPE_ID) +
+            octets::varint_len(capsule_data_wire_len as u64);
+
+        let stream_cap = match conn.stream_capacity(stream_id) {
+            Ok(v) => v,
+
+            Err(e) => {
+                if conn.stream_finished(stream_id) {
+                    self.streams.remove(&stream_id);
+                }
+
+                return Err(e.into());
+            },
+        };
+
+        // Make sure there is enough capacity to send the CAPSULE frame header.
+        if stream_cap < overhead {
+            return Err(Error::Done);
+        }
+
+        trace!(
+            "{} tx frm CAPSULE stream={} len={}",
+            conn.trace_id(),
+            stream_id,
+            capsule_data_wire_len
+        );
+
+        let capsule_type = match capsule_data {
+            CapsuleData::RegisterDatagramContext { .. } =>
+                frame::CAPSULE_REGISTER_DATAGRAM_CONTEXT_TYPE_ID,
+
+            CapsuleData::CloseDatagramContext { .. } =>
+                frame::CAPSULE_CLOSE_DATAGRAM_CONTEXT_TYPE_ID,
+            CapsuleData::Datagram { .. } => frame::CAPSULE_DATAGRAM_TYPE_ID,
+            CapsuleData::Unknown => unreachable!(),
+        };
+
+        let frame = frame::Frame::Capsule {
+            capsule_type,
+            capsule_data,
+        };
+
+        let mut d = vec![42; capsule_data_wire_len + 8];
+        let mut b = octets::OctetsMut::with_slice(&mut d);
+
+        frame.to_bytes(&mut b)?;
+
+        let off = b.off();
+        conn.stream_send(stream_id, &d[..off], false)?;
+
+        Ok(())
+    }
+
     fn open_uni_stream(
         &mut self, conn: &mut super::Connection, ty: u64,
     ) -> Result<u64> {
@@ -2054,6 +2145,26 @@ impl Connection {
                 // TODO: implement CANCEL_PUSH frame
             },
 
+            frame::Frame::Capsule {
+                capsule_type,
+                capsule_data,
+            } => {
+                if Some(stream_id) == self.peer_control_stream_id {
+                    conn.close(
+                        true,
+                        Error::FrameUnexpected.to_wire(),
+                        b"CAPSULE received on control stream",
+                    )?;
+
+                    return Err(Error::FrameUnexpected);
+                }
+
+                return Ok((stream_id, Event::Capsule {
+                    ty: capsule_type,
+                    data: capsule_data,
+                }));
+            },
+
             frame::Frame::Unknown => (),
         }
 
@@ -2394,6 +2505,8 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+    use crate::h3::frame::CAPSULE_REGISTER_DATAGRAM_CONTEXT_TYPE_ID;
+
     use super::*;
 
     use super::testing::*;
@@ -3801,6 +3914,89 @@ mod tests {
         assert_eq!(s.server.poll(&mut s.pipe.server), Err(Error::SettingsError));
 
         assert_eq!(s.client.poll(&mut s.pipe.client), Err(Error::SettingsError));
+    }
+
+    #[test]
+    /// Send a single CAPSULE.
+    fn single_capsule() {
+        let mut buf = [0; 65535];
+        let mut s = Session::default().unwrap();
+        s.handshake().unwrap();
+
+        // send_dgram emits default data of 10 bytes on context ID 0.
+        let dgram_result = (11, 0, 1);
+
+        // Send response, followed by CAPSULE, followed by DATAGRAM
+        let (stream, req) = s.send_request(false).unwrap();
+
+        let capsule_data = CapsuleData::RegisterDatagramContext {
+            context_id: 0,
+            extension_string: b"".to_vec(),
+        };
+
+        let ev_capsule = Event::Capsule {
+            ty: CAPSULE_REGISTER_DATAGRAM_CONTEXT_TYPE_ID,
+            data: capsule_data.clone(),
+        };
+
+        let ev_headers = Event::Headers {
+            list: req,
+            has_body: true,
+        };
+
+        s.client
+            .send_capsule(&mut s.pipe.client, stream, capsule_data)
+            .unwrap();
+
+        s.advance().unwrap();
+
+        s.send_dgram_client(0).unwrap();
+
+        // Now let's test the poll the server
+        assert_eq!(s.poll_server(), Ok((0, Event::Datagram)));
+        assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_server(), Ok((stream, ev_capsule)));
+        assert_eq!(s.poll_server(), Err(Error::Done));
+
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(dgram_result));
+
+        // Send response, followed by CAPSULE, followed by DATAGRAM on server side
+        let resp = s.send_response(stream, false).unwrap();
+
+        // send_dgram emits default data of 10 bytes on context ID 1.
+        let dgram_result = (11, 1, 1);
+
+        let capsule_data = CapsuleData::RegisterDatagramContext {
+            context_id: 1,
+            extension_string: b"".to_vec(),
+        };
+
+        let ev_capsule = Event::Capsule {
+            ty: CAPSULE_REGISTER_DATAGRAM_CONTEXT_TYPE_ID,
+            data: capsule_data.clone(),
+        };
+
+        let ev_headers = Event::Headers {
+            list: resp,
+            has_body: true,
+        };
+
+        s.server
+            .send_capsule(&mut s.pipe.server, stream, capsule_data)
+            .unwrap();
+
+        s.advance().unwrap();
+
+        s.send_dgram_server(1).unwrap();
+
+        // Now let's test the poll the client
+        assert_eq!(s.poll_client(), Ok((0, Event::Datagram)));
+
+        assert_eq!(s.poll_client(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_client(), Ok((stream, ev_capsule)));
+        assert_eq!(s.poll_client(), Err(Error::Done));
+
+        assert_eq!(s.recv_dgram_client(&mut buf), Ok(dgram_result));
     }
 
     #[test]
