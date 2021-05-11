@@ -545,6 +545,19 @@ impl<'a> NameValue for HeaderRef<'a> {
     }
 }
 
+/// HTTP/3 DATAGRAM frame header.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DatagramHeader {
+    /// HTTP/3 Quarter Stream ID
+    pub quarter_stream_id: u64,
+    /// HTTP/3 Quarter Stream ID wire length
+    pub quarter_stream_id_len: usize,
+    /// HTTP/3 Context ID
+    pub context_id: u64,
+    /// HTTP/3 Context ID length
+    pub context_id_len: usize,
+}
+
 /// An HTTP/3 connection event.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
@@ -1057,15 +1070,20 @@ impl Connection {
             conn.dgram_max_writable_len().is_some()
     }
 
-    /// Sends an HTTP/3 DATAGRAM with the specified flow ID.
+    /// Sends an HTTP/3 DATAGRAM with the specified quarter stream ID and
+    /// context ID.
     pub fn send_dgram(
-        &mut self, conn: &mut super::Connection, flow_id: u64, buf: &[u8],
+        &mut self, conn: &mut super::Connection, quarter_stream_id: u64,
+        context_id: u64, buf: &[u8],
     ) -> Result<()> {
-        let len = octets::varint_len(flow_id) + buf.len();
+        let len = octets::varint_len(quarter_stream_id) +
+            octets::varint_len(context_id) +
+            buf.len();
         let mut d = vec![0; len as usize];
         let mut b = octets::OctetsMut::with_slice(&mut d);
 
-        b.put_varint(flow_id)?;
+        b.put_varint(quarter_stream_id)?;
+        b.put_varint(context_id)?;
         b.put_bytes(buf)?;
 
         conn.dgram_send(&d)?;
@@ -1078,25 +1096,39 @@ impl Connection {
     /// Applications should call this method whenever the [`poll()`] method
     /// returns a [`Datagram`] event.
     ///
-    /// On success the DATAGRAM data is returned, with length and Flow ID and
-    /// length of the Flow ID.
+    /// On success the QUIC DATAGRAM frame payload is written to `buf` and its
+    /// length is returned, along with the parsed
+    /// HTTP/3 datagram returned, with total length, Quarter
+    /// Stream ID and it's length, and Context ID and it's length.
     ///
     /// [`Done`] is returned if there is no data to read.
     ///
     /// [`BufferTooShort`] is returned if the provided buffer is too small for
     /// the data.
     ///
-    /// [`poll()`]: struct.Connection.html#method.poll
-    /// [`Datagram`]: enum.Event.html#variant.Datagram
-    /// [`Done`]: enum.Error.html#variant.Done
+    /// [`poll()`]: struct.Connection.html#method.poll [`Datagram`]:
+    /// enum.Event.html#variant.Datagram [`Done`]: enum.Error.html#variant.Done
     /// [`BufferTooShort`]: enum.Error.html#variant.BufferTooShort
     pub fn recv_dgram(
         &mut self, conn: &mut super::Connection, buf: &mut [u8],
-    ) -> Result<(usize, u64, usize)> {
+    ) -> Result<(usize, DatagramHeader)> {
         let len = conn.dgram_recv(buf)?;
         let mut b = octets::Octets::with_slice(buf);
-        let flow_id = b.get_varint()?;
-        Ok((len, flow_id, b.off()))
+
+        let quarter_stream_id = b.get_varint()?;
+        let quarter_stream_id_len = b.off();
+
+        let context_id = b.get_varint()?;
+        let context_id_len = b.off() - quarter_stream_id_len;
+
+        let dgram_hdr = DatagramHeader {
+            quarter_stream_id,
+            quarter_stream_id_len,
+            context_id,
+            context_id_len,
+        };
+
+        Ok((len, dgram_hdr))
     }
 
     /// Returns the maximum HTTP/3 DATAGRAM payload that can be sent.
@@ -2416,11 +2448,17 @@ pub mod testing {
         /// Send an HTTP/3 DATAGRAM with default data from the client.
         ///
         /// On success it returns the data.
-        pub fn send_dgram_client(&mut self, flow_id: u64) -> Result<Vec<u8>> {
+        pub fn send_dgram_client(
+            &mut self, quarter_stream_id: u64, context_id: u64,
+        ) -> Result<Vec<u8>> {
             let bytes = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
-            self.client
-                .send_dgram(&mut self.pipe.client, flow_id, &bytes)?;
+            self.client.send_dgram(
+                &mut self.pipe.client,
+                quarter_stream_id,
+                context_id,
+                &bytes,
+            )?;
 
             self.advance().ok();
 
@@ -2429,22 +2467,28 @@ pub mod testing {
 
         /// Receives an HTTP/3 DATAGRAM from the server.
         ///
-        /// On success it returns the DATAGRAM length, flow ID and flow ID
-        /// length.
+        /// On success it returns the DATAGRAM length, and HTTP/3 DATAGRAM
+        /// header length.
         pub fn recv_dgram_client(
             &mut self, buf: &mut [u8],
-        ) -> Result<(usize, u64, usize)> {
+        ) -> Result<(usize, DatagramHeader)> {
             self.client.recv_dgram(&mut self.pipe.client, buf)
         }
 
         /// Send an HTTP/3 DATAGRAM with default data from the server
         ///
         /// On success it returns the data.
-        pub fn send_dgram_server(&mut self, flow_id: u64) -> Result<Vec<u8>> {
+        pub fn send_dgram_server(
+            &mut self, quarter_stream_id: u64, context_id: u64,
+        ) -> Result<Vec<u8>> {
             let bytes = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
-            self.server
-                .send_dgram(&mut self.pipe.server, flow_id, &bytes)?;
+            self.server.send_dgram(
+                &mut self.pipe.server,
+                quarter_stream_id,
+                context_id,
+                &bytes,
+            )?;
 
             self.advance().ok();
 
@@ -2453,11 +2497,11 @@ pub mod testing {
 
         /// Receives an HTTP/3 DATAGRAM from the client.
         ///
-        /// On success it returns the DATAGRAM length, flow ID and flow ID
-        /// length.
+        /// On success it returns the DATAGRAM length, and HTTP/3 DATAGRAM
+        /// header length.
         pub fn recv_dgram_server(
             &mut self, buf: &mut [u8],
-        ) -> Result<(usize, u64, usize)> {
+        ) -> Result<(usize, DatagramHeader)> {
             self.server.recv_dgram(&mut self.pipe.server, buf)
         }
 
@@ -2499,6 +2543,15 @@ pub mod testing {
             self.advance().ok();
 
             Ok(())
+        }
+    }
+
+    pub fn dgram_header_default() -> DatagramHeader {
+        DatagramHeader {
+            quarter_stream_id: 0,
+            quarter_stream_id_len: 1,
+            context_id: 0,
+            context_id_len: 1,
         }
     }
 }
@@ -3924,7 +3977,7 @@ mod tests {
         s.handshake().unwrap();
 
         // send_dgram emits default data of 10 bytes on context ID 0.
-        let dgram_result = (11, 0, 1);
+        let dgram_result = (12, dgram_header_default());
 
         // Send response, followed by CAPSULE, followed by DATAGRAM
         let (stream, req) = s.send_request(false).unwrap();
@@ -3950,7 +4003,7 @@ mod tests {
 
         s.advance().unwrap();
 
-        s.send_dgram_client(0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
 
         // Now let's test the poll the server
         assert_eq!(s.poll_server(), Ok((0, Event::Datagram)));
@@ -3964,7 +4017,8 @@ mod tests {
         let resp = s.send_response(stream, false).unwrap();
 
         // send_dgram emits default data of 10 bytes on context ID 1.
-        let dgram_result = (11, 1, 1);
+        let mut dgram_result = (12, dgram_header_default());
+        dgram_result.1.context_id = 1;
 
         let capsule_data = CapsuleData::RegisterDatagramContext {
             context_id: 1,
@@ -3987,7 +4041,7 @@ mod tests {
 
         s.advance().unwrap();
 
-        s.send_dgram_server(1).unwrap();
+        s.send_dgram_server(0, 1).unwrap();
 
         // Now let's test the poll the client
         assert_eq!(s.poll_client(), Ok((0, Event::Datagram)));
@@ -4006,16 +4060,20 @@ mod tests {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
 
-        // We'll send default data of 10 bytes on flow ID 0.
-        let result = (11, 0, 1);
+        // We'll send default data of 10 bytes on context ID 0.
+        let result = (12, dgram_header_default());
 
-        s.send_dgram_client(0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
 
         assert_eq!(s.poll_server(), Ok((0, Event::Datagram)));
         assert_eq!(s.recv_dgram_server(&mut buf), Ok(result));
         assert_eq!(s.poll_server(), Err(Error::Done));
 
-        s.send_dgram_server(0).unwrap();
+        // We'll send default data of 10 bytes on context ID 1.
+        let mut result = (12, dgram_header_default());
+        result.1.context_id = 1;
+
+        s.send_dgram_server(0, 1).unwrap();
         assert_eq!(s.poll_client(), Ok((0, Event::Datagram)));
         assert_eq!(s.recv_dgram_client(&mut buf), Ok(result));
     }
@@ -4027,12 +4085,12 @@ mod tests {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
 
-        // We'll send default data of 10 bytes on flow ID 0.
-        let result = (11, 0, 1);
+        // We'll send default data of 10 bytes on context ID 0.
+        let result = (12, dgram_header_default());
 
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
 
         assert_eq!(s.poll_server(), Ok((0, Event::Datagram)));
         assert_eq!(s.recv_dgram_server(&mut buf), Ok(result));
@@ -4044,9 +4102,9 @@ mod tests {
         assert_eq!(s.recv_dgram_server(&mut buf), Err(Error::Done));
         assert_eq!(s.poll_server(), Err(Error::Done));
 
-        s.send_dgram_server(0).unwrap();
-        s.send_dgram_server(0).unwrap();
-        s.send_dgram_server(0).unwrap();
+        s.send_dgram_server(0, 0).unwrap();
+        s.send_dgram_server(0, 0).unwrap();
+        s.send_dgram_server(0, 0).unwrap();
 
         assert_eq!(s.poll_client(), Ok((0, Event::Datagram)));
         assert_eq!(s.poll_server(), Err(Error::Done));
@@ -4067,15 +4125,15 @@ mod tests {
         let mut s = Session::default().unwrap();
         s.handshake().unwrap();
 
-        // We'll send default data of 10 bytes on flow ID 0.
-        let result = (11, 0, 1);
+        // We'll send default data of 10 bytes on context ID 0.
+        let result = (12, dgram_header_default());
 
         // Five DATAGRAMs
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
 
         // Only 3 independent DATAGRAM events will fire.
         assert_eq!(s.poll_server(), Ok((0, Event::Datagram)));
@@ -4124,7 +4182,7 @@ mod tests {
             has_body: true,
         };
 
-        s.send_dgram_client(0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
 
         // Now let's test the poll counts and yielding.
         assert_eq!(s.poll_server(), Ok((0, Event::Datagram)));
@@ -4162,8 +4220,8 @@ mod tests {
         let mut s = Session::with_configs(&mut config, &mut h3_config).unwrap();
         s.handshake().unwrap();
 
-        // We'll send default data of 10 bytes on flow ID 0.
-        let result = (11, 0, 1);
+        // We'll send default data of 10 bytes on context ID 0.
+        let result = (12, dgram_header_default());
 
         // Send request followed by DATAGRAM on client side.
         let (stream, req) = s.send_request(false).unwrap();
@@ -4177,7 +4235,7 @@ mod tests {
             has_body: true,
         };
 
-        s.send_dgram_client(0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
 
         // Now let's test the poll counts and yielding.
         assert_eq!(s.poll_server(), Ok((0, Event::Datagram)));
@@ -4207,7 +4265,7 @@ mod tests {
             has_body: true,
         };
 
-        s.send_dgram_server(0).unwrap();
+        s.send_dgram_server(0, 0).unwrap();
 
         // Now let's test the poll counts and yielding.
         assert_eq!(s.poll_client(), Ok((0, Event::Datagram)));
@@ -4254,9 +4312,10 @@ mod tests {
         let mut s = Session::with_configs(&mut config, &mut h3_config).unwrap();
         s.handshake().unwrap();
 
-        // 10 bytes on flow ID 0 and 2.
-        let flow_0_result = (11, 0, 1);
-        let flow_2_result = (11, 2, 1);
+        // 10 bytes on context ID 0 and 2.
+        let context_0_result = (12, dgram_header_default());
+        let mut context_2_result = (12, dgram_header_default());
+        context_2_result.1.context_id = 2;
 
         // Send requests followed by DATAGRAMs on client side.
         let (stream, req) = s.send_request(false).unwrap();
@@ -4270,16 +4329,16 @@ mod tests {
             has_body: true,
         };
 
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(2).unwrap();
-        s.send_dgram_client(2).unwrap();
-        s.send_dgram_client(2).unwrap();
-        s.send_dgram_client(2).unwrap();
-        s.send_dgram_client(2).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 2).unwrap();
+        s.send_dgram_client(0, 2).unwrap();
+        s.send_dgram_client(0, 2).unwrap();
+        s.send_dgram_client(0, 2).unwrap();
+        s.send_dgram_client(0, 2).unwrap();
 
         // Now let's test the poll counts and yielding.
         assert_eq!(s.poll_server(), Ok((0, Event::Datagram)));
@@ -4290,11 +4349,11 @@ mod tests {
         assert_eq!(s.poll_server(), Err(Error::Done));
 
         // Second cycle, start to read
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_0_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_0_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_0_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
 
         assert_eq!(s.recv_body_server(stream, &mut recv_buf), Ok(body.len()));
@@ -4303,19 +4362,19 @@ mod tests {
         assert_eq!(s.poll_server(), Err(Error::Done));
 
         // Third cycle.
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_0_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_0_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_2_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_2_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_2_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_2_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_2_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
 
         // Send response followed by DATAGRAM on server side
@@ -4330,16 +4389,16 @@ mod tests {
             has_body: true,
         };
 
-        s.send_dgram_server(0).unwrap();
-        s.send_dgram_server(0).unwrap();
-        s.send_dgram_server(0).unwrap();
-        s.send_dgram_server(0).unwrap();
-        s.send_dgram_server(0).unwrap();
-        s.send_dgram_server(2).unwrap();
-        s.send_dgram_server(2).unwrap();
-        s.send_dgram_server(2).unwrap();
-        s.send_dgram_server(2).unwrap();
-        s.send_dgram_server(2).unwrap();
+        s.send_dgram_server(0, 0).unwrap();
+        s.send_dgram_server(0, 0).unwrap();
+        s.send_dgram_server(0, 0).unwrap();
+        s.send_dgram_server(0, 0).unwrap();
+        s.send_dgram_server(0, 0).unwrap();
+        s.send_dgram_server(0, 2).unwrap();
+        s.send_dgram_server(0, 2).unwrap();
+        s.send_dgram_server(0, 2).unwrap();
+        s.send_dgram_server(0, 2).unwrap();
+        s.send_dgram_server(0, 2).unwrap();
 
         assert_eq!(s.poll_client(), Ok((0, Event::Datagram)));
 
@@ -4349,11 +4408,11 @@ mod tests {
         assert_eq!(s.poll_client(), Err(Error::Done));
 
         // Second cycle, start to read
-        assert_eq!(s.recv_dgram_client(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_client(&mut buf), Ok(context_0_result));
         assert_eq!(s.poll_client(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_client(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_client(&mut buf), Ok(context_0_result));
         assert_eq!(s.poll_client(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_client(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_client(&mut buf), Ok(context_0_result));
         assert_eq!(s.poll_client(), Err(Error::Done));
 
         assert_eq!(s.recv_body_client(stream, &mut recv_buf), Ok(body.len()));
@@ -4362,19 +4421,19 @@ mod tests {
         assert_eq!(s.poll_client(), Err(Error::Done));
 
         // Third cycle.
-        assert_eq!(s.recv_dgram_client(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_client(&mut buf), Ok(context_0_result));
         assert_eq!(s.poll_client(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_client(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_client(&mut buf), Ok(context_0_result));
         assert_eq!(s.poll_client(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_client(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_client(&mut buf), Ok(context_2_result));
         assert_eq!(s.poll_client(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_client(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_client(&mut buf), Ok(context_2_result));
         assert_eq!(s.poll_client(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_client(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_client(&mut buf), Ok(context_2_result));
         assert_eq!(s.poll_client(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_client(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_client(&mut buf), Ok(context_2_result));
         assert_eq!(s.poll_client(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_client(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_client(&mut buf), Ok(context_2_result));
         assert_eq!(s.poll_client(), Err(Error::Done));
     }
 
@@ -4606,9 +4665,10 @@ mod tests {
         let mut s = Session::with_configs(&mut config, &mut h3_config).unwrap();
         s.handshake().unwrap();
 
-        // 10 bytes on flow ID 0 and 2.
-        let flow_0_result = (11, 0, 1);
-        let flow_2_result = (11, 2, 1);
+        // 10 bytes on context ID 0 and 2.
+        let context_0_result = (12, dgram_header_default());
+        let mut context_2_result = (12, dgram_header_default());
+        context_2_result.1.context_id = 2;
 
         // Send requests followed by DATAGRAMs on client side.
         let (stream, req) = s.send_request(false).unwrap();
@@ -4622,10 +4682,10 @@ mod tests {
             has_body: true,
         };
 
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(2).unwrap();
-        s.send_dgram_client(2).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 2).unwrap();
+        s.send_dgram_client(0, 2).unwrap();
 
         assert_eq!(s.poll_server(), Ok((0, Event::Datagram)));
 
@@ -4633,29 +4693,29 @@ mod tests {
         assert_eq!(s.poll_server(), Ok((stream, Event::Data)));
 
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_0_result));
 
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_0_result));
 
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_2_result));
 
         assert_eq!(s.poll_server(), Err(Error::Done));
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_2_result));
 
         assert_eq!(s.poll_server(), Err(Error::Done));
 
-        s.send_dgram_client(0).unwrap();
-        s.send_dgram_client(2).unwrap();
+        s.send_dgram_client(0, 0).unwrap();
+        s.send_dgram_client(0, 2).unwrap();
 
         assert_eq!(s.poll_server(), Ok((0, Event::Datagram)));
         assert_eq!(s.poll_server(), Err(Error::Done));
 
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_0_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_0_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
 
-        assert_eq!(s.recv_dgram_server(&mut buf), Ok(flow_2_result));
+        assert_eq!(s.recv_dgram_server(&mut buf), Ok(context_2_result));
         assert_eq!(s.poll_server(), Err(Error::Done));
 
         assert_eq!(s.recv_body_server(stream, &mut recv_buf), Ok(body.len()));

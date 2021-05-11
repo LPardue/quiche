@@ -274,8 +274,8 @@ pub extern fn quiche_h3_dgram_enabled_by_peer(
 
 #[no_mangle]
 pub extern fn quiche_h3_send_dgram(
-    conn: &mut h3::Connection, quic_conn: &mut Connection, flow_id: u64,
-    data: *const u8, data_len: size_t,
+    conn: &mut h3::Connection, quic_conn: &mut Connection,
+    quarter_stream_id: u64, context_id: u64, data: *const u8, data_len: size_t,
 ) -> c_int {
     if data_len > <ssize_t>::max_value() as usize {
         panic!("The provided buffer is too large");
@@ -283,7 +283,7 @@ pub extern fn quiche_h3_send_dgram(
 
     let data = unsafe { slice::from_raw_parts(data, data_len) };
 
-    match conn.send_dgram(quic_conn, flow_id, data) {
+    match conn.send_dgram(quic_conn, quarter_stream_id, context_id, data) {
         Ok(_) => 0,
 
         Err(e) => e.to_c() as c_int,
@@ -292,8 +292,10 @@ pub extern fn quiche_h3_send_dgram(
 
 #[no_mangle]
 pub extern fn quiche_h3_recv_dgram(
-    conn: &mut h3::Connection, quic_conn: &mut Connection, flow_id: *mut u64,
-    flow_id_len: *mut usize, out: *mut u8, out_len: size_t,
+    conn: &mut h3::Connection, quic_conn: &mut Connection,
+    quarter_stream_id: *mut u64, quarter_stream_id_len: *mut usize,
+    context_id: *mut u64, context_id_len: *mut usize, out: *mut u8,
+    out_len: size_t,
 ) -> ssize_t {
     if out_len > <ssize_t>::max_value() as usize {
         panic!("The provided buffer is too large");
@@ -302,9 +304,11 @@ pub extern fn quiche_h3_recv_dgram(
     let out = unsafe { slice::from_raw_parts_mut(out, out_len) };
 
     match conn.recv_dgram(quic_conn, out) {
-        Ok((len, id, id_len)) => {
-            unsafe { *flow_id = id };
-            unsafe { *flow_id_len = id_len };
+        Ok((len, dgram_hdr)) => {
+            unsafe { *quarter_stream_id = dgram_hdr.quarter_stream_id };
+            unsafe { *quarter_stream_id_len = dgram_hdr.quarter_stream_id_len };
+            unsafe { *context_id = dgram_hdr.context_id };
+            unsafe { *context_id_len = dgram_hdr.context_id_len };
             len as ssize_t
         },
 

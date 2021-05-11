@@ -603,7 +603,8 @@ bool quiche_h3_dgram_enabled_by_peer(quiche_h3_conn *conn,
 
 // Writes data to the DATAGRAM send queue.
 ssize_t quiche_h3_send_dgram(quiche_h3_conn *conn, quiche_conn *quic_conn,
-                            uint64_t flow_id, uint8_t *data, size_t data_len);
+                            uint64_t quarter_stream_id, uint64_t context_id,
+                            uint8_t *data, size_t data_len);
 
 // Reads data from the DATAGRAM receive queue.
 ssize_t quiche_h3_recv_dgram(quiche_h3_conn *conn, quiche_conn *quic_conn,

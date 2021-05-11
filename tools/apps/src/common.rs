@@ -745,16 +745,16 @@ impl HttpConn for Http09Conn {
 pub struct Http3DgramSender {
     dgram_count: u64,
     pub dgram_content: String,
-    pub flow_id: u64,
+    pub context_id: u64,
     pub dgrams_sent: u64,
 }
 
 impl Http3DgramSender {
-    pub fn new(dgram_count: u64, dgram_content: String, flow_id: u64) -> Self {
+    pub fn new(dgram_count: u64, dgram_content: String, context_id: u64) -> Self {
         Self {
             dgram_count,
             dgram_content,
-            flow_id,
+            context_id,
             dgrams_sent: 0,
         }
     }
@@ -1060,13 +1060,16 @@ impl HttpConn for Http3Conn {
 
             for _ in ds.dgrams_sent..ds.dgram_count {
                 info!(
-                    "sending HTTP/3 DATAGRAM on flow_id={} with data {:?}",
-                    ds.flow_id,
+                    "sending HTTP/3 DATAGRAM on quarter_stream_id ={} context_id={} with data {:?}",
+                    0, // LP TODO - pick a stream ID (maybe send dgrams on every stream?)
+                    ds.context_id,
                     ds.dgram_content.as_bytes()
                 );
 
                 match self.h3_conn.send_dgram(
                     conn,
+                    0, /* LP TODO - pick a stream ID (maybe send dgrams on
+                        * every stream?) */
                     0,
                     ds.dgram_content.as_bytes(),
                 ) {
@@ -1180,14 +1183,17 @@ impl HttpConn for Http3Conn {
                 },
 
                 Ok((_flow_id, quiche::h3::Event::Datagram)) => {
-                    while let Ok((len, flow_id, flow_id_len)) =
+                    while let Ok((len, dgram_hdr)) =
                         self.h3_conn.recv_dgram(conn, buf)
                     {
                         info!(
-                            "Received DATAGRAM flow_id={} len={} data={:?}",
-                            flow_id,
+                            "Received DATAGRAM len={} dgram_hdr={:?} data={:?}",
                             len,
-                            buf[flow_id_len..len].to_vec()
+                            dgram_hdr,
+                            buf[dgram_hdr.quarter_stream_id_len +
+                                dgram_hdr.context_id_len..
+                                len]
+                                .to_vec()
                         );
                     }
                 },
@@ -1340,14 +1346,17 @@ impl HttpConn for Http3Conn {
                 Ok((_stream_id, quiche::h3::Event::Finished)) => (),
 
                 Ok((_, quiche::h3::Event::Datagram)) => {
-                    while let Ok((len, flow_id, flow_id_len)) =
+                    while let Ok((len, dgram_hdr)) =
                         self.h3_conn.recv_dgram(conn, buf)
                     {
                         info!(
-                            "Received DATAGRAM flow_id={} len={} data={:?}",
-                            flow_id,
+                            "Received DATAGRAM len={} dgram_hdr={:?} data={:?}",
                             len,
-                            buf[flow_id_len..len].to_vec()
+                            dgram_hdr,
+                            buf[dgram_hdr.quarter_stream_id_len +
+                                dgram_hdr.context_id_len..
+                                len]
+                                .to_vec()
                         );
                     }
                 },
@@ -1389,13 +1398,16 @@ impl HttpConn for Http3Conn {
 
             for _ in ds.dgrams_sent..ds.dgram_count {
                 info!(
-                    "sending HTTP/3 DATAGRAM on flow_id={} with data {:?}",
-                    ds.flow_id,
+                    "sending HTTP/3 DATAGRAM on quarter_stream_id={} context_id={} with data {:?}",
+                    0, // LP TODO - pick a stream ID (maybe send dgrams on every stream?)
+                    ds.context_id,
                     ds.dgram_content.as_bytes()
                 );
 
                 match self.h3_conn.send_dgram(
                     conn,
+                    0, /* LP TODO - pick a stream ID (maybe send dgrams on
+                        * every stream?) */
                     0,
                     ds.dgram_content.as_bytes(),
                 ) {
