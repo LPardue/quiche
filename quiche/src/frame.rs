@@ -45,7 +45,27 @@ use qlog::events::quic::StreamType;
 pub const MAX_CRYPTO_OVERHEAD: usize = 8;
 pub const MAX_DGRAM_OVERHEAD: usize = 2;
 pub const MAX_STREAM_OVERHEAD: usize = 12;
+
+/// DATAGRAM frame header length: 1 byte type + 2 byte length varint.
+#[allow(dead_code)]
+pub const DGRAM_HEADER_LEN: usize = 3;
 pub const MAX_STREAM_SIZE: u64 = 1 << 62;
+
+/// QMux transport parameters frame type.
+/// Wire format: 0x3f5153300d0a0d0a (encodes to "\xffQMX\r\n\r\n").
+/// See draft-ietf-quic-qmux-01 Section 4.2.
+#[cfg(feature = "qmux")]
+pub const QMUX_TRANSPORT_PARAMETERS_FRAME_TYPE: u64 = 0x3f5153300d0a0d0a;
+
+/// QMux ping request frame type.
+/// See draft-ietf-quic-qmux-01 Section 4.3.
+#[cfg(feature = "qmux")]
+pub const QMUX_PING_REQUEST_FRAME_TYPE: u64 = 0x348c67529ef8c7bd;
+
+/// QMux ping response frame type (request type + 1).
+/// See draft-ietf-quic-qmux-01 Section 4.3.
+#[cfg(feature = "qmux")]
+pub const QMUX_PING_RESPONSE_FRAME_TYPE: u64 = 0x348c67529ef8c7be;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EcnCounts {
@@ -183,6 +203,29 @@ pub enum Frame {
 
     DatagramHeader {
         length: usize,
+    },
+
+    /// QMux transport parameters frame.
+    ///
+    /// This frame is used in QMux to exchange transport parameters at the
+    /// start of a connection, replacing the TLS extension used in QUIC.
+    /// See draft-ietf-quic-qmux-01 Section 4.2.
+    #[cfg(feature = "qmux")]
+    QmuxTransportParameters {
+        /// Raw encoded transport parameters.
+        params: Vec<u8>,
+    },
+
+    /// QMux ping request/response frame.
+    ///
+    /// This frame allows endpoints to test peer reachability above the
+    /// underlying transport. See draft-ietf-quic-qmux-01 Section 4.3.
+    #[cfg(feature = "qmux")]
+    QmuxPing {
+        /// True if this is a response, false if it's a request.
+        is_response: bool,
+        /// Sequence number to identify the ping.
+        sequence_number: u64,
     },
 }
 
@@ -331,6 +374,24 @@ impl Frame {
 
             0x30 | 0x31 => parse_datagram_frame(frame_type, b)?,
 
+            #[cfg(feature = "qmux")]
+            QMUX_PING_REQUEST_FRAME_TYPE => Frame::QmuxPing {
+                is_response: false,
+                sequence_number: b.get_varint()?,
+            },
+
+            #[cfg(feature = "qmux")]
+            QMUX_PING_RESPONSE_FRAME_TYPE => Frame::QmuxPing {
+                is_response: true,
+                sequence_number: b.get_varint()?,
+            },
+
+            #[cfg(feature = "qmux")]
+            QMUX_TRANSPORT_PARAMETERS_FRAME_TYPE =>
+                Frame::QmuxTransportParameters {
+                    params: b.get_bytes_with_varint_length()?.to_vec(),
+                },
+
             _ => return Err(Error::InvalidFrame),
         };
 
@@ -470,6 +531,7 @@ impl Frame {
                     data.off(),
                     data.len() as u64,
                     data.fin(),
+                    true, // include_length
                     b,
                 )?;
 
@@ -587,12 +649,32 @@ impl Frame {
             },
 
             Frame::Datagram { data } => {
-                encode_dgram_header(data.len() as u64, b)?;
+                encode_dgram_header(data.len() as u64, true, b)?;
 
                 b.put_bytes(data.as_ref())?;
             },
 
             Frame::DatagramHeader { .. } => (),
+
+            #[cfg(feature = "qmux")]
+            Frame::QmuxTransportParameters { params } => {
+                b.put_varint(QMUX_TRANSPORT_PARAMETERS_FRAME_TYPE)?;
+                b.put_varint(params.len() as u64)?;
+                b.put_bytes(params.as_ref())?;
+            },
+
+            #[cfg(feature = "qmux")]
+            Frame::QmuxPing {
+                is_response,
+                sequence_number,
+            } => {
+                if *is_response {
+                    b.put_varint(QMUX_PING_RESPONSE_FRAME_TYPE)?;
+                } else {
+                    b.put_varint(QMUX_PING_REQUEST_FRAME_TYPE)?;
+                }
+                b.put_varint(*sequence_number)?;
+            },
         }
 
         Ok(before - b.cap())
@@ -807,6 +889,21 @@ impl Frame {
                 1 + // frame type
                 2 + // length, always encode as 2-byte varint
                 *length // data
+            },
+
+            #[cfg(feature = "qmux")]
+            Frame::QmuxTransportParameters { params } => {
+                octets::varint_len(QMUX_TRANSPORT_PARAMETERS_FRAME_TYPE) + // frame type
+                octets::varint_len(params.len() as u64) + // length
+                params.len() // params
+            },
+
+            #[cfg(feature = "qmux")]
+            Frame::QmuxPing {
+                sequence_number, ..
+            } => {
+                octets::varint_len(QMUX_PING_REQUEST_FRAME_TYPE) + // frame type (same length for request/response)
+                octets::varint_len(*sequence_number) // sequence_number
             },
         }
     }
@@ -1083,6 +1180,28 @@ impl Frame {
                     data: None,
                 })),
             },
+
+            #[cfg(feature = "qmux")]
+            Frame::QmuxTransportParameters { params: _ } => QuicFrame::Unknown {
+                frame_type_bytes: Some(QMUX_TRANSPORT_PARAMETERS_FRAME_TYPE),
+                raw: None,
+            },
+
+            #[cfg(feature = "qmux")]
+            Frame::QmuxPing {
+                is_response,
+                sequence_number: _,
+            } => {
+                let frame_type = if *is_response {
+                    QMUX_PING_RESPONSE_FRAME_TYPE
+                } else {
+                    QMUX_PING_REQUEST_FRAME_TYPE
+                };
+                QuicFrame::Unknown {
+                    frame_type_bytes: Some(frame_type),
+                    raw: None,
+                }
+            },
         }
     }
 }
@@ -1250,6 +1369,20 @@ impl std::fmt::Debug for Frame {
             Frame::DatagramHeader { length } => {
                 write!(f, "DATAGRAM len={length}")?;
             },
+
+            #[cfg(feature = "qmux")]
+            Frame::QmuxTransportParameters { params } => {
+                write!(f, "QX_TRANSPORT_PARAMETERS len={}", params.len())?;
+            },
+
+            #[cfg(feature = "qmux")]
+            Frame::QmuxPing {
+                is_response,
+                sequence_number,
+            } => {
+                let kind = if *is_response { "response" } else { "request" };
+                write!(f, "QX_PING {kind} seq={sequence_number}")?;
+            },
         }
 
         Ok(())
@@ -1325,8 +1458,13 @@ pub fn encode_crypto_header(
     Ok(())
 }
 
+/// Encodes a STREAM frame header.
+///
+/// If `include_length` is true, the length field is included (2-byte varint).
+/// If false, the length field is omitted (used in QMux when frame extends to
+/// record boundary).
 pub fn encode_stream_header(
-    stream_id: u64, offset: u64, length: u64, fin: bool,
+    stream_id: u64, offset: u64, length: u64, fin: bool, include_length: bool,
     b: &mut octets::OctetsMut,
 ) -> Result<()> {
     let mut ty: u8 = 0x08;
@@ -1334,8 +1472,9 @@ pub fn encode_stream_header(
     // Always encode offset.
     ty |= 0x04;
 
-    // Always encode length.
-    ty |= 0x02;
+    if include_length {
+        ty |= 0x02;
+    }
 
     if fin {
         ty |= 0x01;
@@ -1346,22 +1485,34 @@ pub fn encode_stream_header(
     b.put_varint(stream_id)?;
     b.put_varint(offset)?;
 
-    // Always encode length field as 2-byte varint.
-    b.put_varint_with_len(length, 2)?;
+    if include_length {
+        // Encode length field as 2-byte varint.
+        b.put_varint_with_len(length, 2)?;
+    }
 
     Ok(())
 }
 
-pub fn encode_dgram_header(length: u64, b: &mut octets::OctetsMut) -> Result<()> {
+/// Encodes a DATAGRAM frame header.
+///
+/// If `include_length` is true, the length field is included (2-byte varint).
+/// If false, the length field is omitted (used in QMux when frame extends to
+/// record boundary).
+pub fn encode_dgram_header(
+    length: u64, include_length: bool, b: &mut octets::OctetsMut,
+) -> Result<()> {
     let mut ty: u8 = 0x30;
 
-    // Always encode length
-    ty |= 0x01;
+    if include_length {
+        ty |= 0x01;
+    }
 
     b.put_varint(u64::from(ty))?;
 
-    // Always encode length field as 2-byte varint.
-    b.put_varint_with_len(length, 2)?;
+    if include_length {
+        // Encode length field as 2-byte varint.
+        b.put_varint_with_len(length, 2)?;
+    }
 
     Ok(())
 }

@@ -609,6 +609,10 @@ pub struct Config {
     /// When true, uses the initial max data (for connection
     /// and stream) as the initial flow control window.
     use_initial_max_data_as_flow_control_win: bool,
+
+    /// QMux mode - operate over reliable byte stream instead of UDP.
+    #[cfg(feature = "qmux")]
+    qmux: bool,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -689,6 +693,9 @@ impl Config {
             initial_rtt: DEFAULT_INITIAL_RTT,
 
             use_initial_max_data_as_flow_control_win: false,
+
+            #[cfg(feature = "qmux")]
+            qmux: false,
         })
     }
 
@@ -1264,6 +1271,46 @@ impl Config {
     pub fn set_use_initial_max_data_as_flow_control_win(&mut self, v: bool) {
         self.use_initial_max_data_as_flow_control_win = v;
     }
+
+    /// Enables QMux mode for connections using this configuration.
+    ///
+    /// When enabled, the connection operates over a reliable byte stream
+    /// (e.g., TLS over TCP) instead of UDP datagrams. This disables packet
+    /// encryption, loss recovery, and congestion control since the underlying
+    /// transport handles these.
+    ///
+    /// See draft-ietf-quic-qmux-01 for details.
+    ///
+    /// The default value is `false`.
+    #[cfg(feature = "qmux")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "qmux")))]
+    pub fn enable_qmux(&mut self, enable: bool) {
+        self.qmux = enable;
+        if enable && self.local_transport_params.qmux_max_record_size.is_none() {
+            self.local_transport_params.qmux_max_record_size =
+                Some(transport_params::QMUX_DEFAULT_MAX_RECORD_SIZE);
+        }
+    }
+
+    /// Returns whether QMux mode is enabled.
+    #[cfg(feature = "qmux")]
+    pub(crate) fn is_qmux(&self) -> bool {
+        self.qmux
+    }
+
+    /// Sets the maximum record size for QMux mode.
+    ///
+    /// This limits the maximum size of the Frames field in a QMux record.
+    /// The peer will advertise their own max_record_size, and senders must
+    /// not exceed the peer's advertised limit.
+    ///
+    /// The default value is 16382 bytes (allows 2-byte Size + 16382 bytes =
+    /// 16KB).
+    #[cfg(feature = "qmux")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "qmux")))]
+    pub fn set_qmux_max_record_size(&mut self, size: u64) {
+        self.local_transport_params.qmux_max_record_size = Some(size);
+    }
 }
 
 /// Tracks the health of the tx_buffered value.
@@ -1312,6 +1359,27 @@ impl StreamsBlockedState {
             self.blocked_sent = None;
         }
     }
+}
+
+/// Tracks QX_PING request/response state and RTT measurement.
+#[cfg(feature = "qmux")]
+#[derive(Default)]
+struct QmuxPingTracker {
+    /// Largest QX_PING request sequence number received, pending response.
+    /// Cleared after sending the response.
+    pending_response: Option<u64>,
+
+    /// Whether a QX_PING request should be sent on the next send_qmux() call.
+    requested: bool,
+
+    /// Next sequence number for outgoing QX_PING requests.
+    next_seq: u64,
+
+    /// Outstanding QX_PING requests awaiting response: seq -> send_time.
+    outstanding: std::collections::BTreeMap<u64, Instant>,
+
+    /// Latest RTT measurement from QX_PING.
+    latest_rtt: Option<Duration>,
 }
 
 /// A QUIC connection.
@@ -1603,6 +1671,29 @@ where
 
     /// The anti-amplification limit factor.
     max_amplification_factor: usize,
+
+    /// Whether this connection operates in QMux mode (over a reliable byte
+    /// stream rather than UDP datagrams).
+    #[cfg(feature = "qmux")]
+    qmux: bool,
+
+    /// Whether QX_TRANSPORT_PARAMETERS has been sent (QMux mode only).
+    #[cfg(feature = "qmux")]
+    qmux_transport_params_sent: bool,
+
+    /// Whether QX_TRANSPORT_PARAMETERS has been received (QMux mode only).
+    #[cfg(feature = "qmux")]
+    qmux_transport_params_received: bool,
+
+    /// Peer's advertised qmux_max_record_size transport parameter.
+    /// Initialized to default (16382), updated when peer's transport params
+    /// are received.
+    #[cfg(feature = "qmux")]
+    peer_max_record_size: u64,
+
+    /// QX_PING state tracker.
+    #[cfg(feature = "qmux")]
+    qmux_ping: QmuxPingTracker,
 }
 
 /// Creates a new server-side connection.
@@ -2236,6 +2327,21 @@ impl<F: BufFactory> Connection<F> {
             streams_blocked_uni_state: Default::default(),
 
             max_amplification_factor: config.max_amplification_factor,
+
+            #[cfg(feature = "qmux")]
+            qmux: config.is_qmux(),
+
+            #[cfg(feature = "qmux")]
+            qmux_transport_params_sent: false,
+
+            #[cfg(feature = "qmux")]
+            qmux_transport_params_received: false,
+
+            #[cfg(feature = "qmux")]
+            peer_max_record_size: transport_params::QMUX_DEFAULT_MAX_RECORD_SIZE,
+
+            #[cfg(feature = "qmux")]
+            qmux_ping: QmuxPingTracker::default(),
         };
         conn.streams.set_use_initial_max_data_as_flow_control_win(
             config.use_initial_max_data_as_flow_control_win,
@@ -2851,6 +2957,11 @@ impl<F: BufFactory> Connection<F> {
     /// # Ok::<(), quiche::Error>(())
     /// ```
     pub fn recv(&mut self, buf: &mut [u8], info: RecvInfo) -> Result<usize> {
+        #[cfg(feature = "qmux")]
+        if self.qmux {
+            return self.recv_qmux(buf);
+        }
+
         let len = buf.len();
 
         if len == 0 {
@@ -3986,6 +4097,18 @@ impl<F: BufFactory> Connection<F> {
         &mut self, out: &mut [u8], from: Option<SocketAddr>,
         to: Option<SocketAddr>,
     ) -> Result<(usize, SendInfo)> {
+        #[cfg(feature = "qmux")]
+        if self.qmux {
+            let written = self.send_qmux(out)?;
+            // Return dummy SendInfo since QMux doesn't use UDP addresses
+            let info = SendInfo {
+                from: "0.0.0.0:0".parse().unwrap(),
+                to: "0.0.0.0:0".parse().unwrap(),
+                at: Instant::now(),
+            };
+            return Ok((written, info));
+        }
+
         if out.is_empty() {
             return Err(Error::BufferTooShort);
         }
@@ -5094,6 +5217,7 @@ impl<F: BufFactory> Connection<F> {
 
                                 frame::encode_dgram_header(
                                     len as u64,
+                                    true,
                                     &mut dgram_hdr,
                                 )?;
 
@@ -5133,108 +5257,32 @@ impl<F: BufFactory> Connection<F> {
             path.active() &&
             !dgram_emitted
         {
-            while let Some(priority_key) = self.streams.peek_flushable() {
-                let stream_id = priority_key.id;
-                let stream = match self.streams.get_mut(stream_id) {
-                    // Avoid sending frames for streams that were already stopped.
-                    //
-                    // This might happen if stream data was buffered but not yet
-                    // flushed on the wire when a STOP_SENDING frame is received.
-                    Some(v) if !v.send.is_stopped() => v,
-                    _ => {
-                        self.streams.remove_flushable(&priority_key);
-                        continue;
-                    },
-                };
-
-                let stream_off = stream.send.off_front();
-
-                // Encode the frame.
-                //
-                // Instead of creating a `frame::Frame` object, encode the frame
-                // directly into the packet buffer.
-                //
-                // First we reserve some space in the output buffer for writing
-                // the frame header (we assume the length field is always a
-                // 2-byte varint as we don't know the value yet).
-                //
-                // Then we emit the data from the stream's send buffer.
-                //
-                // Finally we go back and encode the frame header with the now
-                // available information.
-                let hdr_off = b.off();
-                let hdr_len = 1 + // frame type
-                    octets::varint_len(stream_id) + // stream_id
-                    octets::varint_len(stream_off) + // offset
-                    2; // length, always encode as 2-byte varint
-
-                let max_len = match left.checked_sub(hdr_len) {
-                    Some(v) => v,
-                    None => {
-                        let priority_key = Arc::clone(&stream.priority_key);
-                        self.streams.remove_flushable(&priority_key);
-
-                        continue;
-                    },
-                };
-
-                let (mut stream_hdr, mut stream_payload) =
-                    b.split_at(hdr_off + hdr_len)?;
-
-                // Write stream data into the packet buffer.
-                let (len, fin) =
-                    stream.send.emit(&mut stream_payload.as_mut()[..max_len])?;
-
-                // Encode the frame's header.
-                //
-                // Due to how `OctetsMut::split_at()` works, `stream_hdr` starts
-                // from the initial offset of `b` (rather than the current
-                // offset), so it needs to be advanced to the initial frame
-                // offset.
-                stream_hdr.skip(hdr_off)?;
-
-                frame::encode_stream_header(
-                    stream_id,
-                    stream_off,
-                    len as u64,
-                    fin,
-                    &mut stream_hdr,
-                )?;
-
-                // Advance the packet buffer's offset.
-                b.skip(hdr_len + len)?;
-
-                let frame = frame::Frame::StreamHeader {
-                    stream_id,
-                    offset: stream_off,
-                    length: len,
-                    fin,
-                };
-
+            #[cfg(feature = "fuzzing")]
+            while let Ok(frame) =
+                emit_stream_frame(&mut self.streams, &mut b, left)
+            {
                 if push_frame_to_pkt!(b, frames, frame, left) {
                     ack_eliciting = true;
                     in_flight = true;
                     has_data = true;
                 }
 
-                let priority_key = Arc::clone(&stream.priority_key);
-                // If the stream is no longer flushable, remove it from the queue
-                if !stream.is_flushable() {
-                    self.streams.remove_flushable(&priority_key);
-                } else if stream.incremental {
-                    // Shuffle the incremental stream to the back of the
-                    // queue.
-                    self.streams.remove_flushable(&priority_key);
-                    self.streams.insert_flushable(&priority_key);
-                }
-
-                #[cfg(feature = "fuzzing")]
                 // Coalesce STREAM frames when fuzzing.
                 if left > frame::MAX_STREAM_OVERHEAD {
                     continue;
                 }
 
                 break;
+            }
+
+            #[cfg(not(feature = "fuzzing"))]
+            if let Ok(frame) = emit_stream_frame(&mut self.streams, &mut b, left)
+            {
+                if push_frame_to_pkt!(b, frames, frame, left) {
+                    ack_eliciting = true;
+                    in_flight = true;
+                    has_data = true;
+                }
             }
         }
 
@@ -6870,6 +6918,21 @@ impl<F: BufFactory> Connection<F> {
         match self.peer_transport_params.max_datagram_frame_size {
             None => None,
             Some(peer_frame_len) => {
+                // In QMux mode, we don't have packet headers or crypto overhead.
+                // The limit is based on max_record_size (peer's or default).
+                #[cfg(feature = "qmux")]
+                if self.qmux {
+                    let max_record_size = self
+                        .peer_transport_params
+                        .qmux_max_record_size
+                        .unwrap_or(transport_params::QMUX_DEFAULT_MAX_RECORD_SIZE)
+                        as usize;
+                    let max_len =
+                        cmp::min(peer_frame_len as usize, max_record_size);
+                    // Subtract frame overhead (1 byte type + varint length)
+                    return max_len.checked_sub(1 + frame::MAX_DGRAM_OVERHEAD);
+                }
+
                 let dcid = self.destination_id();
                 // Start from the maximum packet size...
                 let mut max_len = self.max_send_udp_payload_size();
@@ -6916,6 +6979,13 @@ impl<F: BufFactory> Connection<F> {
             // processing the other timers.
             self.draining_timer
         } else {
+            // QMux: only idle timer matters - no loss detection or key updates
+            // (underlying transport handles reliability and crypto).
+            #[cfg(feature = "qmux")]
+            if self.qmux {
+                return self.idle_timer;
+            }
+
             // Use the lowest timer value (i.e. "sooner") among idle and loss
             // detection timers. If they are both unset (i.e. `None`) then the
             // result is `None`, but if at least one of them is set then a
@@ -6982,6 +7052,13 @@ impl<F: BufFactory> Connection<F> {
                 self.timed_out = true;
                 return;
             }
+        }
+
+        // QMux: skip key update and loss detection processing
+        // (underlying transport handles reliability and crypto).
+        #[cfg(feature = "qmux")]
+        if self.qmux {
+            return;
         }
 
         if let Some(timer) = self.crypto_ctx[packet::Epoch::Application]
@@ -7464,7 +7541,14 @@ impl<F: BufFactory> Connection<F> {
         }
 
         // When no packet was successfully processed close connection immediately.
-        if self.recv_count == 0 {
+        // For QMux, we always want to send the close frame since the underlying
+        // transport is reliable.
+        #[cfg(feature = "qmux")]
+        let should_close_immediately = self.recv_count == 0 && !self.qmux;
+        #[cfg(not(feature = "qmux"))]
+        let should_close_immediately = self.recv_count == 0;
+
+        if should_close_immediately {
             self.mark_closed();
         }
 
@@ -7596,8 +7680,17 @@ impl<F: BufFactory> Connection<F> {
     }
 
     /// Returns true if the connection handshake is complete.
+    ///
+    /// For QMux mode, this returns true when both sides have exchanged
+    /// QX_TRANSPORT_PARAMETERS frames.
     #[inline]
     pub fn is_established(&self) -> bool {
+        #[cfg(feature = "qmux")]
+        if self.qmux {
+            return self.qmux_transport_params_sent &&
+                self.qmux_transport_params_received;
+        }
+
         self.handshake_completed
     }
 
@@ -7778,6 +7871,38 @@ impl<F: BufFactory> Connection<F> {
         self.is_server
     }
 
+    /// Returns true if the connection is operating in QMux mode.
+    ///
+    /// In QMux mode, the connection operates over a reliable byte stream
+    /// (e.g., TLS over TCP) instead of UDP datagrams.
+    #[cfg(feature = "qmux")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "qmux")))]
+    pub fn is_qmux(&self) -> bool {
+        self.qmux
+    }
+
+    /// Requests a QX_PING be sent to measure RTT.
+    ///
+    /// The ping will be sent on the next `send_qmux()` call. Use
+    /// [`qmux_ping_rtt()`] to retrieve the measured RTT after the response
+    /// is received.
+    ///
+    /// [`qmux_ping_rtt()`]: struct.Connection.html#method.qmux_ping_rtt
+    #[cfg(feature = "qmux")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "qmux")))]
+    pub fn qmux_ping(&mut self) {
+        self.qmux_ping.requested = true;
+    }
+
+    /// Returns the latest RTT measured from a QX_PING round-trip.
+    ///
+    /// Returns `None` if no QX_PING response has been received yet.
+    #[cfg(feature = "qmux")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "qmux")))]
+    pub fn qmux_ping_rtt(&self) -> Option<Duration> {
+        self.qmux_ping.latest_rtt
+    }
+
     fn encode_transport_params(&mut self) -> Result<()> {
         self.handshake.set_quic_transport_params(
             &self.local_transport_params,
@@ -7838,7 +7963,7 @@ impl<F: BufFactory> Connection<F> {
         Ok(())
     }
 
-    fn process_peer_transport_params(
+    pub(crate) fn process_peer_transport_params(
         &mut self, peer_params: TransportParams,
     ) -> Result<()> {
         self.max_tx_data = peer_params.initial_max_data;
@@ -7884,6 +8009,14 @@ impl<F: BufFactory> Connection<F> {
             .set_source_conn_id_limit(peer_params.active_conn_id_limit);
 
         self.peer_transport_params = peer_params;
+
+        #[cfg(feature = "qmux")]
+        {
+            self.peer_max_record_size = self
+                .peer_transport_params
+                .qmux_max_record_size
+                .unwrap_or(transport_params::QMUX_DEFAULT_MAX_RECORD_SIZE);
+        }
 
         Ok(())
     }
@@ -8306,7 +8439,11 @@ impl<F: BufFactory> Connection<F> {
                     return Err(Error::FlowControl);
                 }
 
-                if !was_readable && stream.is_readable() {
+                let is_complete = stream.is_complete();
+                let is_readable_after = stream.is_readable();
+                let local = stream.local;
+
+                if !was_readable && is_readable_after {
                     self.streams.insert_readable(&priority_key);
                 }
 
@@ -8317,6 +8454,17 @@ impl<F: BufFactory> Connection<F> {
 
                 self.reset_stream_remote_count =
                     self.reset_stream_remote_count.saturating_add(1);
+
+                // In QMux mode, try to collect the stream after receiving
+                // RESET_STREAM. In QUIC this happens via ACK processing, but
+                // QMux has no ACKs.
+                #[cfg(feature = "qmux")]
+                if self.qmux && is_complete && !is_readable_after {
+                    let is_writable = priority_key.writable.is_linked();
+                    if !is_writable {
+                        self.streams.collect(stream_id, local);
+                    }
+                }
             },
 
             frame::Frame::StopSending {
@@ -8734,6 +8882,18 @@ impl<F: BufFactory> Connection<F> {
             },
 
             frame::Frame::DatagramHeader { .. } => unreachable!(),
+
+            // QMux frames are only valid in QMux mode. In normal QUIC mode,
+            // receiving these frames is a protocol error.
+            #[cfg(feature = "qmux")]
+            frame::Frame::QmuxTransportParameters { .. } => {
+                return Err(Error::InvalidFrame);
+            },
+
+            #[cfg(feature = "qmux")]
+            frame::Frame::QmuxPing { .. } => {
+                return Err(Error::InvalidFrame);
+            },
         }
 
         Ok(())
@@ -8818,6 +8978,15 @@ impl<F: BufFactory> Connection<F> {
 
     /// Updates send capacity.
     fn update_tx_cap(&mut self) {
+        // QMux: flow control only, no congestion window
+        // (underlying transport handles congestion control).
+        #[cfg(feature = "qmux")]
+        if self.qmux {
+            let cap = (self.max_tx_data - self.tx_data) as usize;
+            self.tx_cap = (cap as f64 * self.tx_cap_factor).ceil() as usize;
+            return;
+        }
+
         let cwin_available = match self.paths.get_active() {
             Ok(p) => p.recovery.cwnd_available() as u64,
             Err(_) => 0,
@@ -8829,6 +8998,12 @@ impl<F: BufFactory> Connection<F> {
     }
 
     fn delivery_rate_check_if_app_limited(&self) -> bool {
+        // QMux: no congestion control, always considered app-limited.
+        #[cfg(feature = "qmux")]
+        if self.qmux {
+            return true;
+        }
+
         // Enter the app-limited phase of delivery rate when these conditions
         // are met:
         //
@@ -8858,6 +9033,12 @@ impl<F: BufFactory> Connection<F> {
     }
 
     fn check_tx_buffered_invariant(&mut self) {
+        // QMux: no in-flight tracking, skip invariant check.
+        #[cfg(feature = "qmux")]
+        if self.qmux {
+            return;
+        }
+
         // tx_buffered should track bytes queued in the stream buffers
         // and unacked retransmitable bytes in the network.
         // If tx_buffered > 0 mark the tx_buffered_state if there are no
@@ -9237,7 +9418,116 @@ impl<F: BufFactory> AsMut<boring::ssl::SslRef> for Connection<F> {
 /// without aborting the connection, except when no other packet was previously
 /// received, in which case the error itself is returned, but only on the
 /// server-side as the client will already have armed the idle timer.
+
+/// Emits a single STREAM frame into the provided buffer.
 ///
+/// Takes a `StreamMap`, `OctetsMut` buffer and available space (`left`).
+/// Writes the STREAM frame at the current buffer offset and advances the
+/// buffer.
+///
+/// Returns a `StreamHeader` frame on success (for recovery tracking), or
+/// `Error::Done` if no stream data is available or there's not enough
+/// buffer space.
+///
+/// This handles the priority queue iteration and stream state updates.
+/// Used by both QUIC packet send and QMux stream send paths.
+fn emit_stream_frame<F: BufFactory>(
+    streams: &mut stream::StreamMap<F>, b: &mut octets::OctetsMut, left: usize,
+) -> Result<frame::Frame> {
+    while let Some(priority_key) = streams.peek_flushable() {
+        let stream_id = priority_key.id;
+        let stream = match streams.get_mut(stream_id) {
+            // Avoid sending frames for streams that were already stopped.
+            //
+            // This might happen if stream data was buffered but not yet
+            // flushed on the wire when a STOP_SENDING frame is received.
+            Some(v) if !v.send.is_stopped() => v,
+            _ => {
+                streams.remove_flushable(&priority_key);
+                continue;
+            },
+        };
+
+        let stream_off = stream.send.off_front();
+
+        // Encode the frame.
+        //
+        // Instead of creating a `frame::Frame` object, encode the frame
+        // directly into the packet buffer.
+        //
+        // First we reserve some space in the output buffer for writing
+        // the frame header (we assume the length field is always a
+        // 2-byte varint as we don't know the value yet).
+        //
+        // Then we emit the data from the stream's send buffer.
+        //
+        // Finally we go back and encode the frame header with the now
+        // available information.
+        let hdr_off = b.off();
+        let hdr_len = 1 + // frame type
+            octets::varint_len(stream_id) + // stream_id
+            octets::varint_len(stream_off) + // offset
+            2; // length, always encode as 2-byte varint
+
+        let max_len = match left.checked_sub(hdr_len) {
+            Some(v) => v,
+            None => {
+                let priority_key = Arc::clone(&stream.priority_key);
+                streams.remove_flushable(&priority_key);
+                continue;
+            },
+        };
+
+        let (mut stream_hdr, mut stream_payload) =
+            b.split_at(hdr_off + hdr_len)?;
+
+        // Write stream data into the packet buffer.
+        let (len, fin) =
+            stream.send.emit(&mut stream_payload.as_mut()[..max_len])?;
+
+        // Encode the frame's header.
+        //
+        // Due to how `OctetsMut::split_at()` works, `stream_hdr` starts
+        // from the initial offset of `b` (rather than the current
+        // offset), so it needs to be advanced to the initial frame
+        // offset.
+        stream_hdr.skip(hdr_off)?;
+
+        frame::encode_stream_header(
+            stream_id,
+            stream_off,
+            len as u64,
+            fin,
+            true, // include_length
+            &mut stream_hdr,
+        )?;
+
+        // Advance the packet buffer's offset.
+        b.skip(hdr_len + len)?;
+
+        let frame = frame::Frame::StreamHeader {
+            stream_id,
+            offset: stream_off,
+            length: len,
+            fin,
+        };
+
+        // Update stream state
+        let priority_key = Arc::clone(&stream.priority_key);
+        if !stream.is_flushable() {
+            streams.remove_flushable(&priority_key);
+        } else if stream.incremental {
+            // Shuffle the incremental stream to the back of the queue.
+            streams.remove_flushable(&priority_key);
+            streams.insert_flushable(&priority_key);
+        }
+
+        return Ok(frame);
+    }
+
+    Err(Error::Done)
+}
+
 /// This must only be used for errors preceding packet authentication. Failures
 /// happening after a packet has been authenticated should still cause the
 /// connection to be aborted.
@@ -9395,6 +9685,9 @@ pub mod test_utils;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, feature = "qmux"))]
+mod qmux_tests;
+
 pub use crate::packet::ConnectionId;
 pub use crate::packet::Header;
 pub use crate::packet::Type;
@@ -9445,3 +9738,9 @@ mod recovery;
 mod stream;
 mod tls;
 mod transport_params;
+
+#[cfg(feature = "qmux")]
+mod qmux;
+
+#[cfg(feature = "qmux")]
+pub use qmux::H3_OVER_QMUX_ALPN;

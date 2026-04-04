@@ -863,12 +863,27 @@ pub struct StreamStateUpdated {
     pub trigger: Option<StreamTrigger>,
 }
 
+/// Direction of frame processing for FramesProcessed events.
+///
+/// Used to indicate whether frames were parsed (received) or created (sent).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameDirection {
+    /// Frames were parsed from incoming data.
+    Parsed,
+    /// Frames were created for outgoing data.
+    Created,
+}
+
 #[serde_with::skip_serializing_none]
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct FramesProcessed {
     pub frames: Vec<QuicFrame>,
 
     pub packet_numbers: Option<u64>,
+
+    /// Direction of frame processing (parsed = received, created = sent).
+    pub direction: Option<FrameDirection>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

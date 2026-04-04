@@ -3211,6 +3211,7 @@ pub mod testing {
     use super::*;
 
     use crate::test_utils;
+    pub use crate::test_utils::TestPipe;
     use crate::DefaultBufFactory;
 
     /// Session is an HTTP/3 test helper structure. It holds a client, server
@@ -3227,24 +3228,31 @@ pub mod testing {
     /// request, responses and individual headers. The full quiche API remains
     /// available for any test that need to do unconventional things (such as
     /// bad behaviour that triggers errors).
-    pub struct Session<F = DefaultBufFactory>
-    where
-        F: BufFactory,
-    {
-        pub pipe: test_utils::Pipe<F>,
+    ///
+    /// The type parameter `P` represents the underlying transport pipe
+    /// (QUIC or QMux). For QUIC, use `Pipe<F>`. For QMux, use `QmuxPipe`.
+    pub struct Session<P: TestPipe = test_utils::Pipe<DefaultBufFactory>> {
+        pub pipe: P,
         pub client: Connection,
         pub server: Connection,
     }
 
-    impl Session {
-        pub fn new() -> Result<Session> {
-            Session::<DefaultBufFactory>::new_with_buf()
+    pub type QuicSession<F = DefaultBufFactory> = Session<test_utils::Pipe<F>>;
+
+    #[cfg(feature = "qmux")]
+    pub type QmuxSession = Session<test_utils::QmuxPipe>;
+
+    impl Session<test_utils::Pipe<DefaultBufFactory>> {
+        pub fn new() -> Result<Session<test_utils::Pipe<DefaultBufFactory>>> {
+            Session::<test_utils::Pipe<DefaultBufFactory>>::new_quic()
         }
 
         pub fn with_configs(
             config: &mut crate::Config, h3_config: &Config,
-        ) -> Result<Session> {
-            Session::<DefaultBufFactory>::with_configs_and_buf(config, h3_config)
+        ) -> Result<Session<test_utils::Pipe<DefaultBufFactory>>> {
+            Session::<test_utils::Pipe<DefaultBufFactory>>::with_quic_configs(
+                config, h3_config,
+            )
         }
 
         pub fn default_configs() -> Result<(crate::Config, Config)> {
@@ -3280,15 +3288,15 @@ pub mod testing {
         }
     }
 
-    impl<F: BufFactory> Session<F> {
-        pub fn new_with_buf() -> Result<Session<F>> {
+    impl<F: BufFactory> Session<test_utils::Pipe<F>> {
+        pub fn new_quic() -> Result<Session<test_utils::Pipe<F>>> {
             let (mut config, h3_config) = Session::default_configs()?;
-            Session::with_configs_and_buf(&mut config, &h3_config)
+            Self::with_quic_configs(&mut config, &h3_config)
         }
 
-        pub fn with_configs_and_buf(
+        pub fn with_quic_configs(
             config: &mut crate::Config, h3_config: &Config,
-        ) -> Result<Session<F>> {
+        ) -> Result<Session<test_utils::Pipe<F>>> {
             let pipe = test_utils::Pipe::with_config_and_buf(config)?;
             let client_dgram = pipe.client.dgram_enabled();
             let server_dgram = pipe.server.dgram_enabled();
@@ -3298,52 +3306,116 @@ pub mod testing {
                 server: Connection::new(h3_config, true, server_dgram)?,
             })
         }
+    }
 
+    #[cfg(feature = "qmux")]
+    impl Session<test_utils::QmuxPipe> {
+        pub fn new_qmux() -> Result<Session<test_utils::QmuxPipe>> {
+            let h3_config = Config::new()?;
+            Self::with_qmux_configs(&h3_config, None)
+        }
+
+        pub fn with_qmux_config(
+            h3_config: &Config,
+        ) -> Result<Session<test_utils::QmuxPipe>> {
+            Self::with_qmux_configs(h3_config, None)
+        }
+
+        pub fn with_qmux_configs(
+            h3_config: &Config, quic_config: Option<&mut crate::Config>,
+        ) -> Result<Session<test_utils::QmuxPipe>> {
+            let pipe = match quic_config {
+                Some(cfg) => test_utils::QmuxPipe::with_config(cfg)?,
+                None => test_utils::QmuxPipe::new()?,
+            };
+            let client_dgram = pipe.client.dgram_enabled();
+            let server_dgram = pipe.server.dgram_enabled();
+            Ok(Session {
+                pipe,
+                client: Connection::new(h3_config, false, client_dgram)?,
+                server: Connection::new(h3_config, true, server_dgram)?,
+            })
+        }
+    }
+
+    /// Creates a default test session.
+    ///
+    /// When the `qmux` feature is enabled, creates a QMux session with
+    /// flow control limits matching the QUIC Session config.
+    /// Otherwise, creates a QUIC session.
+    #[cfg(feature = "qmux")]
+    pub fn quic_or_qmux_session() -> Result<QmuxSession> {
+        let mut config = crate::Config::new(crate::PROTOCOL_VERSION)?;
+        config.load_cert_chain_from_pem_file("examples/cert.crt")?;
+        config.load_priv_key_from_pem_file("examples/cert.key")?;
+        config.set_application_protos(&[crate::qmux::H3_OVER_QMUX_ALPN])?;
+        // Match QUIC H3 Session flow control limits
+        config.set_initial_max_data(1500);
+        config.set_initial_max_stream_data_bidi_local(150);
+        config.set_initial_max_stream_data_bidi_remote(150);
+        config.set_initial_max_stream_data_uni(150);
+        config.set_initial_max_streams_bidi(5);
+        config.set_initial_max_streams_uni(5);
+        config.set_max_idle_timeout(30_000);
+        config.verify_peer(false);
+        config.enable_dgram(true, 3, 3);
+        config.enable_qmux(true);
+
+        let h3_config = Config::new()?;
+        QmuxSession::with_qmux_configs(&h3_config, Some(&mut config))
+    }
+
+    /// Creates a default test session.
+    ///
+    /// When the `qmux` feature is enabled, creates a QMux session.
+    /// Otherwise, creates a QUIC session.
+    #[cfg(not(feature = "qmux"))]
+    pub fn quic_or_qmux_session() -> Result<Session> {
+        Session::new()
+    }
+
+    impl<P: TestPipe> Session<P> {
         /// Do the HTTP/3 handshake so both ends are in sane initial state.
         pub fn handshake(&mut self) -> Result<()> {
             self.pipe.handshake()?;
 
             // Client streams.
-            self.client.send_settings(&mut self.pipe.client)?;
+            self.client.send_settings(self.pipe.client())?;
             self.pipe.advance().ok();
 
-            self.client
-                .open_qpack_encoder_stream(&mut self.pipe.client)?;
+            self.client.open_qpack_encoder_stream(self.pipe.client())?;
             self.pipe.advance().ok();
 
-            self.client
-                .open_qpack_decoder_stream(&mut self.pipe.client)?;
+            self.client.open_qpack_decoder_stream(self.pipe.client())?;
             self.pipe.advance().ok();
 
-            if self.pipe.client.grease {
-                self.client.open_grease_stream(&mut self.pipe.client)?;
+            if self.pipe.client().grease {
+                self.client.open_grease_stream(self.pipe.client())?;
             }
 
             self.pipe.advance().ok();
 
             // Server streams.
-            self.server.send_settings(&mut self.pipe.server)?;
+            self.server.send_settings(self.pipe.server())?;
             self.pipe.advance().ok();
 
-            self.server
-                .open_qpack_encoder_stream(&mut self.pipe.server)?;
+            self.server.open_qpack_encoder_stream(self.pipe.server())?;
             self.pipe.advance().ok();
 
-            self.server
-                .open_qpack_decoder_stream(&mut self.pipe.server)?;
+            self.server.open_qpack_decoder_stream(self.pipe.server())?;
             self.pipe.advance().ok();
 
-            if self.pipe.server.grease {
-                self.server.open_grease_stream(&mut self.pipe.server)?;
+            if self.pipe.server().grease {
+                self.server.open_grease_stream(self.pipe.server())?;
             }
 
             self.advance().ok();
 
-            while self.client.poll(&mut self.pipe.client).is_ok() {
+            while self.client.poll(self.pipe.client()).is_ok() {
                 // Do nothing.
             }
 
-            while self.server.poll(&mut self.pipe.server).is_ok() {
+            while self.server.poll(self.pipe.server()).is_ok() {
                 // Do nothing.
             }
 
@@ -3357,12 +3429,12 @@ pub mod testing {
 
         /// Polls the client for events.
         pub fn poll_client(&mut self) -> Result<(u64, Event)> {
-            self.client.poll(&mut self.pipe.client)
+            self.client.poll(self.pipe.client())
         }
 
         /// Polls the server for events.
         pub fn poll_server(&mut self) -> Result<(u64, Event)> {
-            self.server.poll(&mut self.pipe.server)
+            self.server.poll(self.pipe.server())
         }
 
         /// Sends a request from client with default headers.
@@ -3378,7 +3450,7 @@ pub mod testing {
             ];
 
             let stream =
-                self.client.send_request(&mut self.pipe.client, &req, fin)?;
+                self.client.send_request(self.pipe.client(), &req, fin)?;
 
             self.advance().ok();
 
@@ -3396,12 +3468,8 @@ pub mod testing {
                 Header::new(b"server", b"quiche-test"),
             ];
 
-            self.server.send_response(
-                &mut self.pipe.server,
-                stream,
-                &resp,
-                fin,
-            )?;
+            self.server
+                .send_response(self.pipe.server(), stream, &resp, fin)?;
 
             self.advance().ok();
 
@@ -3417,7 +3485,7 @@ pub mod testing {
             let bytes = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
             self.client
-                .send_body(&mut self.pipe.client, stream, &bytes, fin)?;
+                .send_body(self.pipe.client(), stream, &bytes, fin)?;
 
             self.advance().ok();
 
@@ -3430,7 +3498,7 @@ pub mod testing {
         pub fn recv_body_client(
             &mut self, stream: u64, buf: &mut [u8],
         ) -> Result<usize> {
-            self.client.recv_body(&mut self.pipe.client, stream, buf)
+            self.client.recv_body(self.pipe.client(), stream, buf)
         }
 
         /// Fetches DATA payload from the server.
@@ -3439,8 +3507,7 @@ pub mod testing {
         pub fn recv_body_buf_client<B: bytes::BufMut>(
             &mut self, stream: u64, buf: B,
         ) -> Result<usize> {
-            self.client
-                .recv_body_buf(&mut self.pipe.client, stream, buf)
+            self.client.recv_body_buf(self.pipe.client(), stream, buf)
         }
 
         /// Sends some default payload from server.
@@ -3452,7 +3519,7 @@ pub mod testing {
             let bytes = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
             self.server
-                .send_body(&mut self.pipe.server, stream, &bytes, fin)?;
+                .send_body(self.pipe.server(), stream, &bytes, fin)?;
 
             self.advance().ok();
 
@@ -3465,7 +3532,7 @@ pub mod testing {
         pub fn recv_body_server(
             &mut self, stream: u64, buf: &mut [u8],
         ) -> Result<usize> {
-            self.server.recv_body(&mut self.pipe.server, stream, buf)
+            self.server.recv_body(self.pipe.server(), stream, buf)
         }
 
         /// Fetches DATA payload from the client.
@@ -3474,8 +3541,7 @@ pub mod testing {
         pub fn recv_body_buf_server<B: bytes::BufMut>(
             &mut self, stream: u64, buf: B,
         ) -> Result<usize> {
-            self.server
-                .recv_body_buf(&mut self.pipe.server, stream, buf)
+            self.server.recv_body_buf(self.pipe.server(), stream, buf)
         }
 
         /// Sends a single HTTP/3 frame from the client.
@@ -3489,7 +3555,7 @@ pub mod testing {
             frame.to_bytes(&mut b)?;
 
             let off = b.off();
-            self.pipe.client.stream_send(stream_id, &d[..off], fin)?;
+            self.pipe.client().stream_send(stream_id, &d[..off], fin)?;
 
             self.advance().ok();
 
@@ -3508,7 +3574,7 @@ pub mod testing {
             b.put_varint(flow_id)?;
             b.put_bytes(&bytes)?;
 
-            self.pipe.client.dgram_send(&d)?;
+            self.pipe.client().dgram_send(&d)?;
 
             self.advance().ok();
 
@@ -3522,7 +3588,7 @@ pub mod testing {
         pub fn recv_dgram_client(
             &mut self, buf: &mut [u8],
         ) -> Result<(usize, u64, usize)> {
-            let len = self.pipe.client.dgram_recv(buf)?;
+            let len = self.pipe.client().dgram_recv(buf)?;
             let mut b = octets::Octets::with_slice(buf);
             let flow_id = b.get_varint()?;
 
@@ -3541,7 +3607,7 @@ pub mod testing {
             b.put_varint(flow_id)?;
             b.put_bytes(&bytes)?;
 
-            self.pipe.server.dgram_send(&d)?;
+            self.pipe.server().dgram_send(&d)?;
 
             self.advance().ok();
 
@@ -3555,7 +3621,7 @@ pub mod testing {
         pub fn recv_dgram_server(
             &mut self, buf: &mut [u8],
         ) -> Result<(usize, u64, usize)> {
-            let len = self.pipe.server.dgram_recv(buf)?;
+            let len = self.pipe.server().dgram_recv(buf)?;
             let mut b = octets::Octets::with_slice(buf);
             let flow_id = b.get_varint()?;
 
@@ -3573,7 +3639,7 @@ pub mod testing {
             frame.to_bytes(&mut b)?;
 
             let off = b.off();
-            self.pipe.server.stream_send(stream_id, &d[..off], fin)?;
+            self.pipe.server().stream_send(stream_id, &d[..off], fin)?;
 
             self.advance().ok();
 
@@ -3584,7 +3650,7 @@ pub mod testing {
         pub fn send_arbitrary_stream_data_client(
             &mut self, data: &[u8], stream_id: u64, fin: bool,
         ) -> Result<()> {
-            self.pipe.client.stream_send(stream_id, data, fin)?;
+            self.pipe.client().stream_send(stream_id, data, fin)?;
 
             self.advance().ok();
 
@@ -3595,7 +3661,7 @@ pub mod testing {
         pub fn send_arbitrary_stream_data_server(
             &mut self, data: &[u8], stream_id: u64, fin: bool,
         ) -> Result<()> {
-            self.pipe.server.stream_send(stream_id, data, fin)?;
+            self.pipe.server().stream_send(stream_id, data, fin)?;
 
             self.advance().ok();
 
@@ -3616,6 +3682,118 @@ mod tests {
     /// Make sure that random GREASE values is within the specified limit.
     fn grease_value_in_varint_limit() {
         assert!(grease_value() < 2u64.pow(62) - 1);
+    }
+
+    /// Send a request with no body, get a response with no body.
+    #[test]
+    fn request_no_body_response_no_body_transport() {
+        let mut s = quic_or_qmux_session().unwrap();
+        s.handshake().unwrap();
+
+        let (stream, req) = s.send_request(true).unwrap();
+        assert_eq!(stream, 0);
+
+        let ev_headers = Event::Headers {
+            list: req,
+            more_frames: false,
+        };
+
+        assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_server(), Ok((stream, Event::Finished)));
+
+        let resp = s.send_response(stream, true).unwrap();
+
+        let ev_headers = Event::Headers {
+            list: resp,
+            more_frames: false,
+        };
+
+        assert_eq!(s.poll_client(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_client(), Ok((stream, Event::Finished)));
+        assert_eq!(s.poll_client(), Err(Error::Done));
+    }
+
+    /// Send a request with no body, get a response with one DATA frame.
+    #[test]
+    fn request_no_body_response_one_chunk_transport() {
+        let mut s = quic_or_qmux_session().unwrap();
+        s.handshake().unwrap();
+
+        let (stream, req) = s.send_request(true).unwrap();
+        assert_eq!(stream, 0);
+
+        let ev_headers = Event::Headers {
+            list: req,
+            more_frames: false,
+        };
+
+        assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_server(), Ok((stream, Event::Finished)));
+
+        let resp = s.send_response(stream, false).unwrap();
+        let body = s.send_body_server(stream, true).unwrap();
+
+        let mut recv_buf = vec![0; body.len()];
+
+        let ev_headers = Event::Headers {
+            list: resp,
+            more_frames: true,
+        };
+
+        assert_eq!(s.poll_client(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_client(), Ok((stream, Event::Data)));
+        assert_eq!(s.recv_body_client(stream, &mut recv_buf), Ok(body.len()));
+
+        assert_eq!(s.poll_client(), Ok((stream, Event::Finished)));
+        assert_eq!(s.poll_client(), Err(Error::Done));
+    }
+
+    /// Send a request with a body, get a response with a body.
+    #[test]
+    fn request_with_body_response_with_body_transport() {
+        let mut s = quic_or_qmux_session().unwrap();
+        s.handshake().unwrap();
+
+        let (stream, req) = s.send_request(false).unwrap();
+        assert_eq!(stream, 0);
+
+        let req_body = s.send_body_client(stream, true).unwrap();
+
+        let ev_headers = Event::Headers {
+            list: req,
+            more_frames: true,
+        };
+
+        assert_eq!(s.poll_server(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_server(), Ok((stream, Event::Data)));
+
+        let mut recv_buf = vec![0; req_body.len()];
+        assert_eq!(
+            s.recv_body_server(stream, &mut recv_buf),
+            Ok(req_body.len())
+        );
+
+        assert_eq!(s.poll_server(), Ok((stream, Event::Finished)));
+
+        let resp = s.send_response(stream, false).unwrap();
+        let resp_body = s.send_body_server(stream, true).unwrap();
+
+        let ev_headers = Event::Headers {
+            list: resp,
+            more_frames: true,
+        };
+
+        assert_eq!(s.poll_client(), Ok((stream, ev_headers)));
+        assert_eq!(s.poll_client(), Ok((stream, Event::Data)));
+
+        let mut recv_buf = vec![0; resp_body.len()];
+        assert_eq!(
+            s.recv_body_client(stream, &mut recv_buf),
+            Ok(resp_body.len())
+        );
+
+        assert_eq!(s.poll_client(), Ok((stream, Event::Finished)));
+        assert_eq!(s.poll_client(), Err(Error::Done));
     }
 
     #[cfg(not(feature = "openssl"))] // 0-RTT not supported when using openssl/quictls
@@ -3697,7 +3875,7 @@ mod tests {
     #[test]
     /// Send a request with no body, get a response with no body.
     fn request_no_body_response_no_body() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(true).unwrap();
@@ -3727,7 +3905,7 @@ mod tests {
     #[test]
     /// Send a request with no body, get a response with one DATA frame.
     fn request_no_body_response_one_chunk() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(true).unwrap();
@@ -3765,7 +3943,7 @@ mod tests {
     #[test]
     /// Send a request with no body, get a response with multiple DATA frames.
     fn request_no_body_response_many_chunks() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(true).unwrap();
@@ -3899,7 +4077,7 @@ mod tests {
     #[test]
     /// Send a request with one DATA frame, get a response with no body.
     fn request_one_chunk_response_no_body() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(false).unwrap();
@@ -3934,7 +4112,7 @@ mod tests {
     #[test]
     /// Send a request with multiple DATA frames, get a response with no body.
     fn request_many_chunks_response_no_body() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(false).unwrap();
@@ -3979,7 +4157,7 @@ mod tests {
     /// Send a request with multiple DATA frames, get a response with one DATA
     /// frame.
     fn many_requests_many_chunks_response_one_chunk() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let mut reqs = Vec::new();
@@ -4077,7 +4255,7 @@ mod tests {
     /// Send a request with no body, get a response with one DATA frame and an
     /// empty FIN after reception from the client.
     fn request_no_body_response_one_chunk_empty_fin() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(true).unwrap();
@@ -4117,7 +4295,7 @@ mod tests {
     /// Send a request with no body, get a response with no body followed by
     /// GREASE that is STREAM frame with a FIN.
     fn request_no_body_response_no_body_with_grease() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(true).unwrap();
@@ -4161,7 +4339,7 @@ mod tests {
     #[test]
     /// Try to send DATA frames before HEADERS.
     fn body_response_before_headers() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(true).unwrap();
@@ -4188,7 +4366,7 @@ mod tests {
     /// Try to send DATA frames on wrong streams, ensure the API returns an
     /// error before anything hits the transport layer.
     fn send_body_invalid_client_stream() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         assert_eq!(s.send_body_client(0, true), Err(Error::FrameUnexpected));
@@ -4240,7 +4418,7 @@ mod tests {
     /// Try to send DATA frames on wrong streams, ensure the API returns an
     /// error before anything hits the transport layer.
     fn send_body_invalid_server_stream() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         assert_eq!(s.send_body_server(0, true), Err(Error::FrameUnexpected));
@@ -4291,7 +4469,7 @@ mod tests {
     #[test]
     /// Client sends request with body and trailers.
     fn trailers() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(false).unwrap();
@@ -4336,7 +4514,7 @@ mod tests {
     #[test]
     /// Server responds with a 103, then a 200 with no body.
     fn informational_response() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(true).unwrap();
@@ -4397,7 +4575,7 @@ mod tests {
     /// Server responds with a 103, then attempts to send a 200 using
     /// send_response again, which should fail.
     fn no_multiple_response() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(true).unwrap();
@@ -4446,7 +4624,7 @@ mod tests {
     #[test]
     /// Server attempts to use send_additional_headers before initial response.
     fn no_send_additional_before_initial_response() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(true).unwrap();
@@ -4485,7 +4663,7 @@ mod tests {
     #[test]
     /// Client sends multiple HEADERS before data.
     fn additional_headers_before_data_client() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(false).unwrap();
@@ -4523,7 +4701,7 @@ mod tests {
     #[test]
     /// Client sends multiple HEADERS before data.
     fn data_after_trailers_client() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(false).unwrap();
@@ -4575,7 +4753,7 @@ mod tests {
     #[test]
     /// Send a MAX_PUSH_ID frame from the client on a valid stream.
     fn max_push_id_from_client_good() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_client(
@@ -4591,7 +4769,7 @@ mod tests {
     #[test]
     /// Send a MAX_PUSH_ID frame from the client on an invalid stream.
     fn max_push_id_from_client_bad_stream() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(false).unwrap();
@@ -4616,7 +4794,7 @@ mod tests {
     /// Send a sequence of MAX_PUSH_ID frames from the client that attempt to
     /// reduce the limit.
     fn max_push_id_from_client_limit_reduction() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_client(
@@ -4639,7 +4817,7 @@ mod tests {
     #[test]
     /// Send a MAX_PUSH_ID frame from the server, which is forbidden.
     fn max_push_id_from_server() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_server(
@@ -4655,7 +4833,7 @@ mod tests {
     #[test]
     /// Send a PUSH_PROMISE frame from the client, which is forbidden.
     fn push_promise_from_client() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(false).unwrap();
@@ -4684,7 +4862,7 @@ mod tests {
     #[test]
     /// Send a CANCEL_PUSH frame from the client.
     fn cancel_push_from_client() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_client(
@@ -4700,7 +4878,7 @@ mod tests {
     #[test]
     /// Send a CANCEL_PUSH frame from the client on an invalid stream.
     fn cancel_push_from_client_bad_stream() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(false).unwrap();
@@ -4724,7 +4902,7 @@ mod tests {
     #[test]
     /// Send a CANCEL_PUSH frame from the client.
     fn cancel_push_from_server() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_server(
@@ -4740,7 +4918,7 @@ mod tests {
     #[test]
     /// Send a GOAWAY frame from the client.
     fn goaway_from_client_good() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.client.send_goaway(&mut s.pipe.client, 100).unwrap();
@@ -4754,7 +4932,7 @@ mod tests {
     #[test]
     /// Send a GOAWAY frame from the server.
     fn goaway_from_server_good() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.server.send_goaway(&mut s.pipe.server, 4000).unwrap();
@@ -4767,7 +4945,7 @@ mod tests {
     #[test]
     /// A client MUST NOT send a request after it receives GOAWAY.
     fn client_request_after_goaway() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.server.send_goaway(&mut s.pipe.server, 4000).unwrap();
@@ -4782,7 +4960,7 @@ mod tests {
     #[test]
     /// Send a GOAWAY frame from the server, using an invalid goaway ID.
     fn goaway_from_server_invalid_id() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_server(
@@ -4799,7 +4977,7 @@ mod tests {
     /// Send multiple GOAWAY frames from the server, that increase the goaway
     /// ID.
     fn goaway_from_server_increase_id() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_server(
@@ -4910,7 +5088,7 @@ mod tests {
     #[test]
     /// Send a PRIORITY_UPDATE for request stream from the client.
     fn priority_update_request() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.client
@@ -4928,7 +5106,7 @@ mod tests {
     #[test]
     /// Send a PRIORITY_UPDATE for request stream from the client.
     fn priority_update_single_stream_rearm() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.client
@@ -4976,7 +5154,7 @@ mod tests {
     /// Send multiple PRIORITY_UPDATE frames for different streams from the
     /// client across multiple flights of exchange.
     fn priority_update_request_multiple_stream_arm_multiple_flights() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.client
@@ -5022,7 +5200,7 @@ mod tests {
     /// Send multiple PRIORITY_UPDATE frames for different streams from the
     /// client across a single flight.
     fn priority_update_request_multiple_stream_arm_single_flight() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let mut d = [42; 65535];
@@ -5072,7 +5250,7 @@ mod tests {
     /// Send a PRIORITY_UPDATE for a request stream, before and after the stream
     /// has been completed.
     fn priority_update_request_collected_completed() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.client
@@ -5126,7 +5304,7 @@ mod tests {
     /// Send a PRIORITY_UPDATE for a request stream, before and after the stream
     /// has been stopped.
     fn priority_update_request_collected_stopped() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.client
@@ -5184,7 +5362,7 @@ mod tests {
     #[test]
     /// Send a PRIORITY_UPDATE for push stream from the client.
     fn priority_update_push() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_client(
@@ -5204,7 +5382,7 @@ mod tests {
     /// Send a PRIORITY_UPDATE for request stream from the client but for an
     /// incorrect stream type.
     fn priority_update_request_bad_stream() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_client(
@@ -5224,7 +5402,7 @@ mod tests {
     /// Send a PRIORITY_UPDATE for push stream from the client but for an
     /// incorrect stream type.
     fn priority_update_push_bad_stream() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_client(
@@ -5243,7 +5421,7 @@ mod tests {
     #[test]
     /// Send a PRIORITY_UPDATE for request stream from the server.
     fn priority_update_request_from_server() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_server(
@@ -5262,7 +5440,7 @@ mod tests {
     #[test]
     /// Send a PRIORITY_UPDATE for request stream from the server.
     fn priority_update_push_from_server() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_server(
@@ -5293,7 +5471,7 @@ mod tests {
     #[test]
     /// Client opens multiple control streams, which is forbidden.
     fn open_multiple_control_streams() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let stream_id = s.client.next_uni_stream_id;
@@ -5318,7 +5496,7 @@ mod tests {
     #[test]
     /// Client closes the control stream, which is forbidden.
     fn close_control_stream_after_type() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.pipe
@@ -5339,7 +5517,7 @@ mod tests {
     /// Client closes the control stream after a frame is sent, which is
     /// forbidden.
     fn close_control_stream_after_frame() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_client(
@@ -5359,7 +5537,7 @@ mod tests {
     #[test]
     /// Client resets the control stream, which is forbidden.
     fn reset_control_stream_after_type() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.pipe
@@ -5384,7 +5562,7 @@ mod tests {
     /// Client resets the control stream after a frame is sent, which is
     /// forbidden.
     fn reset_control_stream_after_frame() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.send_frame_client(
@@ -5417,7 +5595,7 @@ mod tests {
     #[test]
     /// Client closes QPACK stream, which is forbidden.
     fn close_qpack_stream_after_type() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.pipe
@@ -5441,7 +5619,7 @@ mod tests {
     #[test]
     /// Client closes QPACK stream after sending some stuff, which is forbidden.
     fn close_qpack_stream_after_data() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let stream_id = s.client.local_qpack_streams.encoder_stream_id.unwrap();
@@ -5462,7 +5640,7 @@ mod tests {
     #[test]
     /// Client resets QPACK stream, which is forbidden.
     fn reset_qpack_stream_after_type() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         s.pipe
@@ -5486,7 +5664,7 @@ mod tests {
     #[test]
     /// Client resets QPACK stream after sending some stuff, which is forbidden.
     fn reset_qpack_stream_after_data() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let stream_id = s.client.local_qpack_streams.encoder_stream_id.unwrap();
@@ -5518,7 +5696,7 @@ mod tests {
     fn qpack_data() {
         // TODO: QPACK instructions are ignored until dynamic table support is
         // added so we just test that the data is safely ignored.
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let e_stream_id = s.client.local_qpack_streams.encoder_stream_id.unwrap();
@@ -5552,7 +5730,7 @@ mod tests {
     #[test]
     /// Tests limits for the stream state buffer maximum size.
     fn max_state_buf_size() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let req = vec![
@@ -5594,7 +5772,7 @@ mod tests {
         assert_eq!(s.server.poll(&mut s.pipe.server), Ok((0, Event::Data)));
 
         // GREASE frames consume the state buffer, so need to be limited.
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let mut d = [42; 128];
@@ -5619,7 +5797,7 @@ mod tests {
     fn stream_backpressure() {
         let bytes = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(false).unwrap();
@@ -5735,7 +5913,7 @@ mod tests {
     #[test]
     /// Tests that Error::TransportError contains a transport error.
     fn transport_error() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let req = vec![
@@ -5771,7 +5949,7 @@ mod tests {
     #[test]
     /// Tests that sending DATA before HEADERS causes an error.
     fn data_before_headers() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let mut d = [42; 128];
@@ -5796,7 +5974,7 @@ mod tests {
     #[test]
     /// Tests that calling poll() after an error occurred does nothing.
     fn poll_after_error() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let mut d = [42; 128];
@@ -6239,7 +6417,7 @@ mod tests {
     #[test]
     /// Test handling of 0-length DATA writes with and without fin.
     fn zero_length_data() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(false).unwrap();
@@ -6635,7 +6813,7 @@ mod tests {
     /// Send a single DATAGRAM.
     fn single_dgram() {
         let mut buf = [0; 65535];
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         // We'll send default data of 10 bytes on flow ID 0.
@@ -6655,7 +6833,7 @@ mod tests {
     /// Send multiple DATAGRAMs.
     fn multiple_dgram() {
         let mut buf = [0; 65535];
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         // We'll send default data of 10 bytes on flow ID 0.
@@ -6686,7 +6864,7 @@ mod tests {
     /// Send more DATAGRAMs than the send queue allows.
     fn multiple_dgram_overflow() {
         let mut buf = [0; 65535];
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         // We'll send default data of 10 bytes on flow ID 0.
@@ -6983,7 +7161,7 @@ mod tests {
     /// Tests that the Finished event is not issued for streams of unknown type
     /// (e.g. GREASE).
     fn finished_is_for_requests() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         assert_eq!(s.poll_client(), Err(Error::Done));
@@ -6999,7 +7177,7 @@ mod tests {
     #[test]
     /// Tests that streams are marked as finished only once.
     fn finished_once() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (stream, req) = s.send_request(false).unwrap();
@@ -7027,7 +7205,7 @@ mod tests {
     fn data_event_rearm() {
         let bytes = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         let (r1_id, r1_hdrs) = s.send_request(false).unwrap();
@@ -7305,7 +7483,7 @@ mod tests {
     fn reset_stream() {
         let mut buf = [0; 65535];
 
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         // Client sends request.
@@ -7338,21 +7516,14 @@ mod tests {
             final_size: 68,
         }];
 
-        let pkt_type = crate::packet::Type::Short;
-        assert_eq!(
-            s.pipe.send_pkt_to_server(pkt_type, &frames, &mut buf),
-            Ok(39)
-        );
+        s.pipe.send_frames_to_server(&frames, &mut buf).unwrap();
 
         // Server issues Reset event for the stream.
         assert_eq!(s.poll_server(), Ok((stream, Event::Reset(42))));
         assert_eq!(s.poll_server(), Err(Error::Done));
 
         // Sending RESET_STREAM again shouldn't trigger another Reset event.
-        assert_eq!(
-            s.pipe.send_pkt_to_server(pkt_type, &frames, &mut buf),
-            Ok(39)
-        );
+        s.pipe.send_frames_to_server(&frames, &mut buf).unwrap();
 
         assert_eq!(s.poll_server(), Err(Error::Done));
     }
@@ -7362,7 +7533,7 @@ mod tests {
     #[test]
     fn client_shutdown_write_server_fin() {
         let mut buf = [0; 65535];
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         // Client sends request.
@@ -7460,7 +7631,7 @@ mod tests {
     #[test]
     fn client_shutdown_read() {
         let mut buf = [0; 65535];
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         // Client sends request and leaves stream open.
@@ -7523,7 +7694,7 @@ mod tests {
 
     #[test]
     fn reset_finished_at_server() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         // Client sends HEADERS and doesn't fin
@@ -7563,7 +7734,7 @@ mod tests {
 
     #[test]
     fn reset_finished_at_server_with_data_pending() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         // Client sends HEADERS and doesn't fin.
@@ -7602,7 +7773,7 @@ mod tests {
 
     #[test]
     fn reset_finished_at_server_with_data_pending_2() {
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         // Client sends HEADERS and doesn't fin.
@@ -7646,7 +7817,7 @@ mod tests {
     #[test]
     fn reset_finished_at_client() {
         let mut buf = [0; 65535];
-        let mut s = Session::new().unwrap();
+        let mut s = quic_or_qmux_session().unwrap();
         s.handshake().unwrap();
 
         // Client sends HEADERS and doesn't fin
@@ -7705,11 +7876,7 @@ mod tests {
             final_size: 68,
         }];
 
-        let pkt_type = crate::packet::Type::Short;
-        assert_eq!(
-            s.pipe.send_pkt_to_server(pkt_type, &frames, &mut buf),
-            Ok(39)
-        );
+        s.pipe.send_frames_to_server(&frames, &mut buf).unwrap();
 
         assert_eq!(s.pipe.advance(), Ok(()));
 

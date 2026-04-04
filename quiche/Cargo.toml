@@ -61,6 +61,10 @@ ffi = ["dep:cdylib-link-lines"]
 # Exposes internal APIs that have no stability guarantees across versions.
 internal = []
 
+# QMux protocol support - QUIC stream multiplexing over reliable byte streams.
+# See draft-ietf-quic-qmux-01.
+qmux = []
+
 # Enable qlog support with serde_json for extension data
 qlog = ["dep:qlog", "dep:serde", "dep:serde_json", "dep:serde_with"]
 

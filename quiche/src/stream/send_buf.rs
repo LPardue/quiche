@@ -527,6 +527,11 @@ impl<F: BufFactory> SendBuf<F> {
         self.data.is_empty()
     }
 
+    /// Returns the amount of data currently buffered.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
     /// Returns the highest contiguously acked offset.
     pub fn ack_off(&self) -> u64 {
         match self.acked.iter().next() {

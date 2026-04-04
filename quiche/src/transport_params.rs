@@ -185,6 +185,12 @@ pub struct TransportParams {
     pub retry_source_connection_id: Option<ConnectionId<'static>>,
     /// DATAGRAM frame extension parameter, if any.
     pub max_datagram_frame_size: Option<u64>,
+    /// QMux max record size parameter (QMux-specific).
+    /// Limits the maximum size of the Frames field in a QMux record.
+    /// Default is 16382 (allows 2-byte Size varint + 16382 bytes = 16KB TLS
+    /// record).
+    #[cfg(feature = "qmux")]
+    pub qmux_max_record_size: Option<u64>,
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
     // pub preferred_address: ...,
@@ -210,10 +216,23 @@ impl Default for TransportParams {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
+            #[cfg(feature = "qmux")]
+            qmux_max_record_size: None,
             unknown_params: Default::default(),
         }
     }
 }
+
+/// QMux max_record_size transport parameter ID.
+/// See draft-ietf-quic-qmux-01 Section 5.2.
+#[cfg(feature = "qmux")]
+pub const QMUX_MAX_RECORD_SIZE_PARAM_ID: u64 = 0x0571c59429cd0845;
+
+/// Default max record size for QMux.
+/// This value (16382) allows a 2-byte Size varint + 16382-byte Frames field,
+/// aligning with the default capacity of a full-sized TLS record.
+#[cfg(feature = "qmux")]
+pub const QMUX_DEFAULT_MAX_RECORD_SIZE: u64 = 16382;
 
 impl TransportParams {
     pub(crate) fn decode(
@@ -368,6 +387,11 @@ impl TransportParams {
 
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
+                },
+
+                #[cfg(feature = "qmux")]
+                QMUX_MAX_RECORD_SIZE_PARAM_ID => {
+                    tp.qmux_max_record_size = Some(val.get_varint()?);
                 },
 
                 // Track unknown transport parameters specially.
@@ -555,9 +579,316 @@ impl TransportParams {
             b.put_varint(max_datagram_frame_size)?;
         }
 
+        #[cfg(feature = "qmux")]
+        if let Some(qmux_max_record_size) = tp.qmux_max_record_size {
+            assert!(qmux_max_record_size <= octets::MAX_VAR_INT);
+            TransportParams::encode_param(
+                &mut b,
+                QMUX_MAX_RECORD_SIZE_PARAM_ID,
+                octets::varint_len(qmux_max_record_size),
+            )?;
+            b.put_varint(qmux_max_record_size)?;
+        }
+
         let out_len = b.off();
 
         Ok(&mut out[..out_len])
+    }
+
+    /// Encodes transport parameters for QMux.
+    ///
+    /// Per QMux spec Section 5.1, only these params are permitted:
+    /// - max_idle_timeout (0x0001)
+    /// - initial_max_data (0x0004)
+    /// - initial_max_stream_data_bidi_local (0x0005)
+    /// - initial_max_stream_data_bidi_remote (0x0006)
+    /// - initial_max_stream_data_uni (0x0007)
+    /// - initial_max_streams_bidi (0x0008)
+    /// - initial_max_streams_uni (0x0009)
+    /// - max_datagram_frame_size (0x0020) - for datagram extension
+    /// - qmux_max_record_size (QMUX_MAX_RECORD_SIZE_PARAM_ID)
+    #[cfg(feature = "qmux")]
+    pub(crate) fn encode_for_qmux<'a>(
+        tp: &TransportParams, out: &'a mut [u8],
+    ) -> Result<&'a mut [u8]> {
+        let mut b = octets::OctetsMut::with_slice(out);
+
+        if tp.max_idle_timeout != 0 {
+            TransportParams::encode_param(
+                &mut b,
+                0x0001,
+                octets::varint_len(tp.max_idle_timeout),
+            )?;
+            b.put_varint(tp.max_idle_timeout)?;
+        }
+
+        if tp.initial_max_data != 0 {
+            TransportParams::encode_param(
+                &mut b,
+                0x0004,
+                octets::varint_len(tp.initial_max_data),
+            )?;
+            b.put_varint(tp.initial_max_data)?;
+        }
+
+        if tp.initial_max_stream_data_bidi_local != 0 {
+            TransportParams::encode_param(
+                &mut b,
+                0x0005,
+                octets::varint_len(tp.initial_max_stream_data_bidi_local),
+            )?;
+            b.put_varint(tp.initial_max_stream_data_bidi_local)?;
+        }
+
+        if tp.initial_max_stream_data_bidi_remote != 0 {
+            TransportParams::encode_param(
+                &mut b,
+                0x0006,
+                octets::varint_len(tp.initial_max_stream_data_bidi_remote),
+            )?;
+            b.put_varint(tp.initial_max_stream_data_bidi_remote)?;
+        }
+
+        if tp.initial_max_stream_data_uni != 0 {
+            TransportParams::encode_param(
+                &mut b,
+                0x0007,
+                octets::varint_len(tp.initial_max_stream_data_uni),
+            )?;
+            b.put_varint(tp.initial_max_stream_data_uni)?;
+        }
+
+        if tp.initial_max_streams_bidi != 0 {
+            TransportParams::encode_param(
+                &mut b,
+                0x0008,
+                octets::varint_len(tp.initial_max_streams_bidi),
+            )?;
+            b.put_varint(tp.initial_max_streams_bidi)?;
+        }
+
+        if tp.initial_max_streams_uni != 0 {
+            TransportParams::encode_param(
+                &mut b,
+                0x0009,
+                octets::varint_len(tp.initial_max_streams_uni),
+            )?;
+            b.put_varint(tp.initial_max_streams_uni)?;
+        }
+
+        if let Some(max_datagram_frame_size) = tp.max_datagram_frame_size {
+            TransportParams::encode_param(
+                &mut b,
+                0x0020,
+                octets::varint_len(max_datagram_frame_size),
+            )?;
+            b.put_varint(max_datagram_frame_size)?;
+        }
+
+        if let Some(qmux_max_record_size) = tp.qmux_max_record_size {
+            TransportParams::encode_param(
+                &mut b,
+                QMUX_MAX_RECORD_SIZE_PARAM_ID,
+                octets::varint_len(qmux_max_record_size),
+            )?;
+            b.put_varint(qmux_max_record_size)?;
+        }
+
+        let out_len = b.off();
+
+        Ok(&mut out[..out_len])
+    }
+
+    /// Decodes transport parameters for QMux.
+    ///
+    /// Per QMux spec Section 5.1, forbidden params cause an error.
+    #[cfg(feature = "qmux")]
+    pub(crate) fn decode_for_qmux(buf: &[u8]) -> Result<TransportParams> {
+        /// Returns a human-readable name for a transport parameter ID.
+        fn tp_id_name(id: u64) -> &'static str {
+            match id {
+                0x0000 => "original_destination_connection_id",
+                0x0001 => "max_idle_timeout",
+                0x0002 => "stateless_reset_token",
+                0x0003 => "max_udp_payload_size",
+                0x0004 => "initial_max_data",
+                0x0005 => "initial_max_stream_data_bidi_local",
+                0x0006 => "initial_max_stream_data_bidi_remote",
+                0x0007 => "initial_max_stream_data_uni",
+                0x0008 => "initial_max_streams_bidi",
+                0x0009 => "initial_max_streams_uni",
+                0x000a => "ack_delay_exponent",
+                0x000b => "max_ack_delay",
+                0x000c => "disable_active_migration",
+                0x000d => "preferred_address",
+                0x000e => "active_connection_id_limit",
+                0x000f => "initial_source_connection_id",
+                0x0010 => "retry_source_connection_id",
+                0x0020 => "max_datagram_frame_size",
+                QMUX_MAX_RECORD_SIZE_PARAM_ID => "qmux_max_record_size",
+                _ => "unknown",
+            }
+        }
+
+        let mut tp = TransportParams::default();
+        let mut b = octets::Octets::with_slice(buf);
+
+        trace!("QMux: decoding transport params ({} bytes)", buf.len());
+
+        // First pass: log all params for debugging
+        {
+            let mut scan = octets::Octets::with_slice(buf);
+            while scan.cap() > 0 {
+                let id = scan.get_varint().unwrap_or(0);
+                let len = scan.get_varint().unwrap_or(0) as usize;
+                trace!(
+                    "QMux: [scan] param id={:#x} ({}) len={}",
+                    id,
+                    tp_id_name(id),
+                    len
+                );
+                if scan.skip(len).is_err() {
+                    break;
+                }
+            }
+        }
+
+        while b.cap() > 0 {
+            let id = b.get_varint()?;
+            let len = b.get_varint()? as usize;
+
+            trace!("QMux: transport param id={:#x} len={}", id, len);
+
+            // Check for forbidden params per QMux Section 5.1
+            match id {
+                // Permitted params
+                0x0001 | // max_idle_timeout
+                0x0004 | // initial_max_data
+                0x0005 | // initial_max_stream_data_bidi_local
+                0x0006 | // initial_max_stream_data_bidi_remote
+                0x0007 | // initial_max_stream_data_uni
+                0x0008 | // initial_max_streams_bidi
+                0x0009 | // initial_max_streams_uni
+                0x0020   // max_datagram_frame_size
+                    => (),
+
+                // qmux_max_record_size is also permitted
+                QMUX_MAX_RECORD_SIZE_PARAM_ID => (),
+
+                // Unknown params (not defined in QUIC v1) should be ignored
+                // per spec: "When receiving transport parameters not defined
+                // in QUIC version 1, receivers MUST ignore them"
+                id if id > 0x0020 && id != QMUX_MAX_RECORD_SIZE_PARAM_ID => {
+                    trace!("QMux: ignoring unknown param id={:#x}", id);
+                    b.skip(len)?;
+                    continue;
+                },
+
+                // All other known QUIC v1 params are forbidden per spec:
+                // "Use of other transport parameters defined in QUIC version 1
+                // is prohibited."
+                _ => {
+                    error!(
+                        "QMux: forbidden QUIC v1 transport param id={:#x} ({}) len={}",
+                        id,
+                        tp_id_name(id),
+                        len
+                    );
+                    return Err(Error::InvalidTransportParam);
+                },
+            }
+
+            // Parse permitted params
+            match id {
+                0x0001 => {
+                    tp.max_idle_timeout = b.get_varint()?;
+                    trace!("QMux:   max_idle_timeout={}", tp.max_idle_timeout);
+                },
+
+                0x0004 => {
+                    tp.initial_max_data = b.get_varint()?;
+                    trace!("QMux:   initial_max_data={}", tp.initial_max_data);
+                },
+
+                0x0005 => {
+                    tp.initial_max_stream_data_bidi_local = b.get_varint()?;
+                    trace!(
+                        "QMux:   initial_max_stream_data_bidi_local={}",
+                        tp.initial_max_stream_data_bidi_local
+                    );
+                },
+
+                0x0006 => {
+                    tp.initial_max_stream_data_bidi_remote = b.get_varint()?;
+                    trace!(
+                        "QMux:   initial_max_stream_data_bidi_remote={}",
+                        tp.initial_max_stream_data_bidi_remote
+                    );
+                },
+
+                0x0007 => {
+                    tp.initial_max_stream_data_uni = b.get_varint()?;
+                    trace!(
+                        "QMux:   initial_max_stream_data_uni={}",
+                        tp.initial_max_stream_data_uni
+                    );
+                },
+
+                0x0008 => {
+                    tp.initial_max_streams_bidi = b.get_varint()?;
+                    trace!(
+                        "QMux:   initial_max_streams_bidi={}",
+                        tp.initial_max_streams_bidi
+                    );
+                    if tp.initial_max_streams_bidi > MAX_STREAM_ID {
+                        return Err(Error::InvalidTransportParam);
+                    }
+                },
+
+                0x0009 => {
+                    tp.initial_max_streams_uni = b.get_varint()?;
+                    trace!(
+                        "QMux:   initial_max_streams_uni={}",
+                        tp.initial_max_streams_uni
+                    );
+                    if tp.initial_max_streams_uni > MAX_STREAM_ID {
+                        return Err(Error::InvalidTransportParam);
+                    }
+                },
+
+                0x0020 => {
+                    tp.max_datagram_frame_size = Some(b.get_varint()?);
+                    trace!(
+                        "QMux:   max_datagram_frame_size={:?}",
+                        tp.max_datagram_frame_size
+                    );
+                },
+
+                QMUX_MAX_RECORD_SIZE_PARAM_ID => {
+                    let value = b.get_varint()?;
+                    trace!("QMux:   qmux_max_record_size={}", value);
+
+                    // Per spec Section 5.2: "By sending the transport
+                    // parameter, the maximum record size can only be
+                    // increased. When receiving a value below the initial
+                    // value, receivers MUST close the connection with an
+                    // error of type TRANSPORT_PARAMETER_ERROR."
+                    if value < QMUX_DEFAULT_MAX_RECORD_SIZE {
+                        error!(
+                            "QMux: qmux_max_record_size {} below minimum {}",
+                            value, QMUX_DEFAULT_MAX_RECORD_SIZE
+                        );
+                        return Err(Error::InvalidTransportParam);
+                    }
+                    tp.qmux_max_record_size = Some(value);
+                },
+
+                _ => unreachable!(),
+            }
+        }
+
+        trace!("QMux: transport params decoded successfully");
+        Ok(tp)
     }
 
     /// Creates a qlog event for connection transport parameters and TLS fields

@@ -53,6 +53,8 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: Some(b"retry".to_vec().into()),
         max_datagram_frame_size: Some(32),
+        #[cfg(feature = "qmux")]
+        qmux_max_record_size: None,
         unknown_params: Default::default(),
     };
 
@@ -83,12 +85,15 @@ fn transport_params() {
         initial_source_connection_id: Some(b"woot woot".to_vec().into()),
         retry_source_connection_id: None,
         max_datagram_frame_size: Some(32),
+        #[cfg(feature = "qmux")]
+        qmux_max_record_size: None,
         unknown_params: Default::default(),
     };
 
     let mut raw_params = [42; 256];
     let raw_params =
         TransportParams::encode(&tp, false, &mut raw_params).unwrap();
+    assert_eq!(raw_params.len(), 69);
     assert_eq!(raw_params.len(), 69);
 
     let new_tp = TransportParams::decode(raw_params, true, None).unwrap();

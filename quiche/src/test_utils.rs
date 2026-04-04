@@ -30,6 +30,36 @@ use smallvec::smallvec;
 
 use crate::recovery::Sent;
 
+/// Trait for test pipe implementations that provide client/server connections.
+///
+/// This allows H3 tests to be generic over the underlying transport (QUIC or
+/// QMux).
+pub trait TestPipe {
+    /// The buffer factory type used by connections in this pipe.
+    type BufFactory: BufFactory;
+
+    /// Returns mutable reference to the client connection.
+    fn client(&mut self) -> &mut Connection<Self::BufFactory>;
+
+    /// Returns mutable reference to the server connection.
+    fn server(&mut self) -> &mut Connection<Self::BufFactory>;
+
+    /// Advances the pipe, exchanging data between client and server.
+    fn advance(&mut self) -> Result<()>;
+
+    /// Performs any necessary handshake (QUIC TLS handshake, or no-op for
+    /// QMux).
+    fn handshake(&mut self) -> Result<()>;
+
+    /// Sends frames from client to server.
+    ///
+    /// For QUIC, this wraps frames in a packet. For QMux, frames are sent
+    /// directly. Returns the number of bytes consumed by the server.
+    fn send_frames_to_server(
+        &mut self, frames: &[frame::Frame], buf: &mut [u8],
+    ) -> Result<usize>;
+}
+
 pub struct Pipe<F = DefaultBufFactory>
 where
     F: BufFactory,
@@ -395,6 +425,32 @@ impl<F: BufFactory> Pipe<F> {
     }
 }
 
+impl<F: BufFactory> TestPipe for Pipe<F> {
+    type BufFactory = F;
+
+    fn client(&mut self) -> &mut Connection<Self::BufFactory> {
+        &mut self.client
+    }
+
+    fn server(&mut self) -> &mut Connection<Self::BufFactory> {
+        &mut self.server
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        Pipe::advance(self)
+    }
+
+    fn handshake(&mut self) -> Result<()> {
+        Pipe::handshake(self)
+    }
+
+    fn send_frames_to_server(
+        &mut self, frames: &[frame::Frame], buf: &mut [u8],
+    ) -> Result<usize> {
+        self.send_pkt_to_server(Type::Short, frames, buf)
+    }
+}
+
 pub fn recv_send<F: BufFactory>(
     conn: &mut Connection<F>, buf: &mut [u8], len: usize,
 ) -> Result<usize> {
@@ -678,4 +734,239 @@ pub fn trigger_ack_based_loss<F: BufFactory>(
         from: sender.paths.get_active().unwrap().peer_addr(),
     };
     sender.recv(&mut buf[..ack_len], info).unwrap();
+}
+
+// ============================================================================
+// QMux test utilities
+// ============================================================================
+
+/// Test utility for QMux connections.
+///
+/// QmuxPipe provides a pair of QMux connections (client and server) that
+/// can exchange data via in-memory byte buffers. Unlike the regular QUIC
+/// Pipe, QMux doesn't require packet encryption or TLS handshake.
+#[cfg(feature = "qmux")]
+pub struct QmuxPipe {
+    pub client: Connection,
+    pub server: Connection,
+}
+
+#[cfg(feature = "qmux")]
+impl QmuxPipe {
+    /// Creates a default QMux configuration.
+    pub fn default_config() -> Result<Config> {
+        let mut config = Config::new(PROTOCOL_VERSION)?;
+        config.load_cert_chain_from_pem_file("examples/cert.crt")?;
+        config.load_priv_key_from_pem_file("examples/cert.key")?;
+        config.set_application_protos(&[H3_OVER_QMUX_ALPN])?;
+        config.set_initial_max_data(1_000_000);
+        config.set_initial_max_stream_data_bidi_local(100_000);
+        config.set_initial_max_stream_data_bidi_remote(100_000);
+        config.set_initial_max_stream_data_uni(100_000);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(100);
+        config.set_max_idle_timeout(30_000);
+        config.verify_peer(false);
+        config.enable_dgram(true, 3, 3);
+        config.enable_qmux(true);
+        Ok(config)
+    }
+
+    /// Creates a new QmuxPipe with default configuration.
+    pub fn new() -> Result<QmuxPipe> {
+        let mut config = Self::default_config()?;
+        Self::with_config(&mut config)
+    }
+
+    /// Creates a new QmuxPipe with custom configuration.
+    pub fn with_config(config: &mut Config) -> Result<QmuxPipe> {
+        let mut client_scid = [0; 16];
+        rand::rand_bytes(&mut client_scid[..]);
+        let client_scid = ConnectionId::from_ref(&client_scid);
+        let client_addr = "127.0.0.1:1234".parse().unwrap();
+
+        let mut server_scid = [0; 16];
+        rand::rand_bytes(&mut server_scid[..]);
+        let server_scid = ConnectionId::from_ref(&server_scid);
+        let server_addr = "127.0.0.1:4321".parse().unwrap();
+
+        let mut client = connect(
+            Some("localhost"),
+            &client_scid,
+            client_addr,
+            server_addr,
+            config,
+        )?;
+
+        let mut server =
+            accept(&server_scid, None, server_addr, client_addr, config)?;
+
+        // Perform QMux handshake by exchanging QX_TRANSPORT_PARAMETERS.
+        let mut buf = [0u8; 65536];
+
+        // Client sends QX_TRANSPORT_PARAMETERS
+        let (client_written, _) = client.send(&mut buf)?;
+
+        // Server receives and sends its QX_TRANSPORT_PARAMETERS
+        let recv_info = RecvInfo {
+            from: client_addr,
+            to: server_addr,
+        };
+        server.recv(&mut buf[..client_written], recv_info)?;
+
+        let (server_written, _) = server.send(&mut buf)?;
+
+        // Client receives server's QX_TRANSPORT_PARAMETERS
+        let recv_info = RecvInfo {
+            from: server_addr,
+            to: client_addr,
+        };
+        client.recv(&mut buf[..server_written], recv_info)?;
+
+        // Both should now be established
+        assert!(client.is_established());
+        assert!(server.is_established());
+
+        Ok(QmuxPipe { client, server })
+    }
+
+    /// Sends data from client to server.
+    ///
+    /// Returns the number of bytes transferred.
+    pub fn client_to_server(&mut self) -> Result<usize> {
+        let mut buf = [0u8; 65536];
+
+        // send() dispatches to send_qmux()
+        let (written, _) = match self.client.send(&mut buf) {
+            Ok(v) => v,
+            Err(Error::Done) => return Ok(0),
+            Err(e) => return Err(e),
+        };
+
+        if written == 0 {
+            return Ok(0);
+        }
+
+        // recv() API dispatches to recv_qmux()
+        // RecvInfo is ignored in QMux mode, so we use dummy addresses.
+        let info = RecvInfo {
+            from: "127.0.0.1:1234".parse().unwrap(),
+            to: "127.0.0.1:4321".parse().unwrap(),
+        };
+        let consumed = self.server.recv(&mut buf[..written], info)?;
+        Ok(consumed)
+    }
+
+    /// Sends data from server to client.
+    ///
+    /// Returns the number of bytes transferred.
+    pub fn server_to_client(&mut self) -> Result<usize> {
+        let mut buf = [0u8; 65536];
+
+        // send() dispatches to send_qmux()
+        let (written, _) = match self.server.send(&mut buf) {
+            Ok(v) => v,
+            Err(Error::Done) => return Ok(0),
+            Err(e) => return Err(e),
+        };
+
+        if written == 0 {
+            return Ok(0);
+        }
+
+        // recv() API dispatches to recv_qmux()
+        // RecvInfo is ignored in QMux mode, so we use dummy addresses.
+        let info = RecvInfo {
+            from: "127.0.0.1:4321".parse().unwrap(),
+            to: "127.0.0.1:1234".parse().unwrap(),
+        };
+        let consumed = self.client.recv(&mut buf[..written], info)?;
+        Ok(consumed)
+    }
+
+    /// Advances the pipe, exchanging data in both directions until done.
+    pub fn advance(&mut self) -> Result<()> {
+        let mut client_done = false;
+        let mut server_done = false;
+
+        while !client_done || !server_done {
+            match self.client_to_server() {
+                Ok(0) => client_done = true,
+                Ok(_) => (),
+                Err(Error::Done) => client_done = true,
+                Err(e) => return Err(e),
+            }
+
+            match self.server_to_client() {
+                Ok(0) => server_done = true,
+                Ok(_) => (),
+                Err(Error::Done) => server_done = true,
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Sends raw frames from client to server.
+    ///
+    /// This is the QMux equivalent of `Pipe::send_pkt_to_server()`. It encodes
+    /// the frames directly and feeds them to the server's recv path.
+    pub fn send_frames_to_server(
+        &mut self, frames: &[frame::Frame], buf: &mut [u8],
+    ) -> Result<usize> {
+        // Write frames to a temp buffer first.
+        let mut frames_buf = [0u8; 65536];
+        let mut fb = octets::OctetsMut::with_slice(&mut frames_buf);
+
+        for frame in frames {
+            frame.to_bytes(&mut fb)?;
+        }
+
+        let frames_len = fb.off();
+        if frames_len == 0 {
+            return Ok(0);
+        }
+
+        // Wrap in a record: Size (varint) + Frames
+        let mut b = octets::OctetsMut::with_slice(buf);
+        b.put_varint(frames_len as u64)?;
+        b.put_bytes(&frames_buf[..frames_len])?;
+        let record_len = b.off();
+
+        let info = RecvInfo {
+            from: "127.0.0.1:1234".parse().unwrap(),
+            to: "127.0.0.1:4321".parse().unwrap(),
+        };
+        self.server.recv(&mut buf[..record_len], info)
+    }
+}
+
+#[cfg(feature = "qmux")]
+impl TestPipe for QmuxPipe {
+    type BufFactory = DefaultBufFactory;
+
+    fn client(&mut self) -> &mut Connection<Self::BufFactory> {
+        &mut self.client
+    }
+
+    fn server(&mut self) -> &mut Connection<Self::BufFactory> {
+        &mut self.server
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        QmuxPipe::advance(self)
+    }
+
+    fn handshake(&mut self) -> Result<()> {
+        // QMux doesn't need a handshake - connections are already established
+        // when the QmuxPipe is created (TLS happens at transport layer).
+        Ok(())
+    }
+
+    fn send_frames_to_server(
+        &mut self, frames: &[frame::Frame], buf: &mut [u8],
+    ) -> Result<usize> {
+        QmuxPipe::send_frames_to_server(self, frames, buf)
+    }
 }
