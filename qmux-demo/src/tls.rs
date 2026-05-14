@@ -26,6 +26,10 @@
 
 //! TLS setup for QMux connections.
 
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::sync::Mutex;
+
 use boring::ssl::AlpnError;
 use boring::ssl::SslAcceptor;
 use boring::ssl::SslConnector;
@@ -41,6 +45,28 @@ use crate::Error;
 use crate::Result;
 use crate::H3_OVER_QMUX_ALPN;
 use crate::HQ_INTEROP_QMUX_ALPN;
+
+/// Build an SSL keylog callback closure if `SSLKEYLOGFILE` is set.
+///
+/// Returns a closure that appends each NSS key material line to the file,
+/// suitable for passing to `SslContextBuilder::set_keylog_callback`.
+fn keylog_callback(
+) -> Option<impl Fn(&boring::ssl::SslRef, &str) + Send + Sync + 'static> {
+    let path = std::env::var_os("SSLKEYLOGFILE")?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .expect("failed to open SSLKEYLOGFILE");
+    let file = Mutex::new(file);
+    log::info!("SSL key logging enabled: {:?}", path);
+    Some(move |_ssl: &boring::ssl::SslRef, line: &str| {
+        if let Ok(mut f) = file.lock() {
+            let _ = writeln!(f, "{}", line);
+            let _ = f.flush();
+        }
+    })
+}
 
 /// Negotiated protocol after TLS handshake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +95,10 @@ pub fn create_client_connector_with_alpn(
         builder.set_verify(SslVerifyMode::NONE);
     } else if let Some(ca) = ca_cert {
         builder.set_ca_file(ca)?;
+    }
+
+    if let Some(cb) = keylog_callback() {
+        builder.set_keylog_callback(cb);
     }
 
     Ok(builder.build())
@@ -107,6 +137,10 @@ pub fn create_server_acceptor(
             Err(AlpnError::NOACK)
         }
     });
+
+    if let Some(cb) = keylog_callback() {
+        builder.set_keylog_callback(cb);
+    }
 
     Ok(builder.build())
 }
