@@ -25,6 +25,10 @@ endif
 
 LIBS = $(LIB_DIR)/libquiche.a -lev -ldl -pthread -lm
 
+BSSL_INCLUDE_DIR = ../deps/boringssl/src/include
+QMUX_INCS = -I$(INCLUDE_DIR) -I$(BSSL_INCLUDE_DIR)
+QMUX_LIBS = $(LIB_DIR)/libquiche.a -lev -ldl -pthread -lm
+
 all: client server http3-client http3-server
 
 client: client.c $(INCLUDE_DIR)/quiche.h $(LIB_DIR)/libquiche.a
@@ -39,8 +43,11 @@ http3-client: http3-client.c $(INCLUDE_DIR)/quiche.h $(LIB_DIR)/libquiche.a
 http3-server: http3-server.c $(INCLUDE_DIR)/quiche.h $(LIB_DIR)/libquiche.a
 	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $@ $(INCS) $(LIBS)
 
+qmux-client: qmux-client.c $(INCLUDE_DIR)/quiche.h $(LIB_DIR)/libquiche.a
+	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $@ $(QMUX_INCS) $(QMUX_LIBS)
+
 $(LIB_DIR)/libquiche.a: $(shell find $(SOURCE_DIR) -type f -name '*.rs')
-	cd .. && cargo build --target-dir $(BUILD_DIR) --features ffi
+	cd .. && cargo build --target-dir $(BUILD_DIR) --features ffi,qmux
 
 clean:
-	@$(RM) -rf client server http3-client http3-server build/ *.dSYM/
+	@$(RM) -rf client server http3-client http3-server qmux-client build/ *.dSYM/

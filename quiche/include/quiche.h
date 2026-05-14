@@ -279,6 +279,15 @@ void quiche_config_set_disable_dcid_reuse(quiche_config *config, bool v);
 // Configures the session ticket key material.
 int quiche_config_set_ticket_key(quiche_config *config, const uint8_t *key, size_t key_len);
 
+// Enables or disables QMux mode. When enabled, the connection operates over
+// a reliable byte stream (e.g. TLS over TCP) instead of QUIC/UDP.
+// Requires the library to be built with the `qmux` feature.
+void quiche_config_enable_qmux(quiche_config *config, bool v);
+
+// Sets the maximum QMux record size. Must be >= 16382.
+// Only meaningful when QMux mode is enabled.
+void quiche_config_set_qmux_max_record_size(quiche_config *config, uint64_t v);
+
 // Frees the config object.
 void quiche_config_free(quiche_config *config);
 
@@ -541,6 +550,18 @@ bool quiche_conn_is_closed(const quiche_conn *conn);
 
 // Returns true if the connection was closed due to the idle timeout.
 bool quiche_conn_is_timed_out(const quiche_conn *conn);
+
+// Returns true if the connection is in QMux mode.
+// Requires the library to be built with the `qmux` feature.
+bool quiche_conn_is_qmux(const quiche_conn *conn);
+
+// Requests a QX_PING be sent on the next call to quiche_conn_send().
+// Only meaningful for QMux connections.
+void quiche_conn_qmux_ping(quiche_conn *conn);
+
+// Returns the latest QX_PING round-trip time in nanoseconds, or 0 if no
+// QX_PING response has been received yet. Only meaningful for QMux connections.
+uint64_t quiche_conn_qmux_ping_rtt_nanos(const quiche_conn *conn);
 
 // Returns true if a connection error was received, and updates the provided
 // parameters accordingly.
@@ -963,6 +984,9 @@ ssize_t quiche_get_varint(const uint8_t *buf, size_t buf_len,
 
 // List of ALPN tokens of supported HTTP/3 versions.
 #define QUICHE_H3_APPLICATION_PROTOCOL "\x02h3"
+
+// ALPN token for HTTP/3 over QMux (draft-ietf-quic-qmux-01).
+#define QUICHE_H3_OVER_QMUX_APPLICATION_PROTOCOL "\x07h3qx-01"
 
 enum quiche_h3_error {
     // There is no error or no work to do

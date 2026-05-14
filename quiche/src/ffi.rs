@@ -447,6 +447,20 @@ pub extern "C" fn quiche_config_set_ticket_key(
 }
 
 #[no_mangle]
+#[cfg(feature = "qmux")]
+pub extern "C" fn quiche_config_enable_qmux(config: &mut Config, v: bool) {
+    config.enable_qmux(v);
+}
+
+#[no_mangle]
+#[cfg(feature = "qmux")]
+pub extern "C" fn quiche_config_set_qmux_max_record_size(
+    config: &mut Config, v: u64,
+) {
+    config.set_qmux_max_record_size(v);
+}
+
+#[no_mangle]
 pub extern "C" fn quiche_config_free(config: *mut Config) {
     drop(unsafe { Box::from_raw(config) });
 }
@@ -1261,6 +1275,28 @@ pub extern "C" fn quiche_conn_is_closed(conn: &Connection) -> bool {
 #[no_mangle]
 pub extern "C" fn quiche_conn_is_timed_out(conn: &Connection) -> bool {
     conn.is_timed_out()
+}
+
+#[no_mangle]
+#[cfg(feature = "qmux")]
+pub extern "C" fn quiche_conn_is_qmux(conn: &Connection) -> bool {
+    conn.is_qmux()
+}
+
+#[no_mangle]
+#[cfg(feature = "qmux")]
+pub extern "C" fn quiche_conn_qmux_ping(conn: &mut Connection) {
+    conn.qmux_ping();
+}
+
+#[no_mangle]
+#[cfg(feature = "qmux")]
+pub extern "C" fn quiche_conn_qmux_ping_rtt_nanos(conn: &Connection) -> u64 {
+    match conn.qmux_ping_rtt() {
+        Some(d) => d.as_nanos() as u64,
+
+        None => 0,
+    }
 }
 
 #[no_mangle]
