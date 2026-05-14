@@ -404,6 +404,9 @@ int main(int argc, char *argv[]) {
     }
 
     // Set ALPN to h3qx-01.
+    // Note: certificate verification is not configured in this example.
+    // In production, use SSL_CTX_set_default_verify_paths() and
+    // SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL).
     static const uint8_t alpn[] = "\x07h3qx-01";
     SSL_CTX_set_alpn_protos(ssl_ctx, alpn, sizeof(alpn) - 1);
 

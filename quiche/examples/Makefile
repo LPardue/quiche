@@ -46,6 +46,8 @@ http3-server: http3-server.c $(INCLUDE_DIR)/quiche.h $(LIB_DIR)/libquiche.a
 qmux-client: qmux-client.c $(INCLUDE_DIR)/quiche.h $(LIB_DIR)/libquiche.a
 	$(CC) $(CFLAGS) $(LDFLAGS) $< -o $@ $(QMUX_INCS) $(QMUX_LIBS)
 
+# Note: qmux feature is always enabled so qmux-client can link against
+# the same libquiche.a. The qmux feature adds no overhead when unused.
 $(LIB_DIR)/libquiche.a: $(shell find $(SOURCE_DIR) -type f -name '*.rs')
 	cd .. && cargo build --target-dir $(BUILD_DIR) --features ffi,qmux
 
