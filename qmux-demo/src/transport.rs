@@ -49,6 +49,10 @@ pub struct QmuxOverTls<S> {
     read_buf: Vec<u8>,
     read_len: usize,
     dummy_addr: SocketAddr,
+    /// Maximum bytes per TLS write. 0 means unlimited (default).
+    /// Setting this to a small value (e.g. 32) forces QMux records to span
+    /// multiple TLS records, useful for testing desegmentation.
+    max_tls_write: usize,
 }
 
 impl<S> QmuxOverTls<S>
@@ -62,7 +66,17 @@ where
             read_buf: vec![0u8; 65536],
             read_len: 0,
             dummy_addr: DUMMY_ADDR.parse().unwrap(),
+            max_tls_write: 0,
         }
+    }
+
+    /// Set the maximum bytes per TLS write.
+    ///
+    /// Setting this to a small value (e.g. 32) forces QMux records to be
+    /// split across multiple TLS records, useful for testing Wireshark
+    /// desegmentation.
+    pub fn set_max_tls_write(&mut self, max: usize) {
+        self.max_tls_write = max;
     }
 
     /// Read data from the TLS stream and feed it to the QMux connection.
@@ -121,6 +135,10 @@ where
     }
 
     /// Write pending QMux output to the TLS stream.
+    ///
+    /// If `max_tls_write` is set, each QMux record is split into chunks
+    /// of that size, each written as a separate TLS record. This is useful
+    /// for testing Wireshark's QMux desegmentation.
     pub async fn send(&mut self, conn: &mut quiche::Connection) -> Result<()> {
         let mut out = [0u8; 65536];
 
@@ -131,8 +149,20 @@ where
                 Err(e) => return Err(e.into()),
             };
 
-            log::trace!("TLS write {} bytes", written);
-            self.stream.write_all(&out[..written]).await?;
+            if self.max_tls_write > 0 {
+                // Write in small chunks to force multiple TLS records.
+                let mut pos = 0;
+                while pos < written {
+                    let end = std::cmp::min(pos + self.max_tls_write, written);
+                    log::trace!("TLS write chunk {} bytes (of {})", end - pos, written);
+                    self.stream.write_all(&out[pos..end]).await?;
+                    self.stream.flush().await?;
+                    pos = end;
+                }
+            } else {
+                log::trace!("TLS write {} bytes", written);
+                self.stream.write_all(&out[..written]).await?;
+            }
         }
 
         self.stream.flush().await?;

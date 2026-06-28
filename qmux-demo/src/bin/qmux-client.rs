@@ -155,6 +155,16 @@ struct Args {
     /// Data to send in each DATAGRAM
     #[arg(long, default_value = "quack")]
     dgram_data: String,
+
+    /// Max bytes per TLS write (0 = unlimited). Forces QMux records to span
+    /// multiple TLS records for testing Wireshark desegmentation.
+    #[arg(long, default_value = "0")]
+    max_tls_write: usize,
+
+    /// Max QMux record size in bytes (0 = default 16382). Controls how much
+    /// frame data quiche packs into each QMux record.
+    #[arg(long, default_value = "0")]
+    max_record_size: u64,
 }
 
 #[tokio::main]
@@ -206,7 +216,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         log::info!("Connecting to {} (host: {})", addr, host);
         let tls_stream = connect_tls(&addr, host, &connector).await?;
         log::info!("TLS handshake complete");
-        run_client(QmuxOverTls::new(tls_stream), host, path, &args).await
+        let mut qmux = QmuxOverTls::new(tls_stream);
+        if args.max_tls_write > 0 {
+            qmux.set_max_tls_write(args.max_tls_write);
+            log::info!("Max TLS write size: {} bytes", args.max_tls_write);
+        }
+        run_client(qmux, host, path, &args).await
     }
 }
 
@@ -226,6 +241,10 @@ where
     config.set_initial_max_streams_bidi(args.max_streams_bidi);
     config.set_initial_max_streams_uni(args.max_streams_uni);
     config.set_max_idle_timeout(args.idle_timeout);
+    if args.max_record_size > 0 {
+        config.set_qmux_max_record_size(args.max_record_size);
+        log::info!("Max QMux record size: {} bytes", args.max_record_size);
+    }
     if args.dgram_count > 0 {
         config.enable_dgram(true, 1000, 1000);
     }

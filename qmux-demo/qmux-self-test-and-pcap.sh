@@ -107,9 +107,9 @@ fi
 # Give capture tool time to start.
 sleep 1
 
-echo "==> Starting qmux-server on ${LISTEN}..."
+echo "==> Starting qmux-server on ${LISTEN} (dgram-echo enabled)..."
 SSLKEYLOGFILE="${SSLKEYLOG}" RUST_LOG=info \
-    "${SERVER_BIN}" --listen "${LISTEN}" \
+    "${SERVER_BIN}" --listen "${LISTEN}" --dgram-echo \
     ${QMUX_SERVER_ARGS:-} \
     > "${SERVER_LOG}" 2>&1 &
 SERVER_PID=$!
@@ -124,9 +124,10 @@ if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
 fi
 echo "    Server running (PID ${SERVER_PID})"
 
-echo "==> Running qmux-client: ${URL}"
+echo "==> Running qmux-client: ${URL} (with 3 datagrams)"
 SSLKEYLOGFILE="${SSLKEYLOG}" RUST_LOG=info \
     "${CLIENT_BIN}" --no-verify "${URL}" \
+    --dgram-count 3 --dgram-data "hello-datagram" \
     ${QMUX_CLIENT_ARGS:-} \
     > "${CLIENT_LOG}" 2>&1 || true
 echo "    Client finished"

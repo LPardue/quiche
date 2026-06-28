@@ -164,6 +164,16 @@ struct Args {
     /// Enable DATAGRAM support and echo received datagrams
     #[arg(long)]
     dgram_echo: bool,
+
+    /// Max bytes per TLS write (0 = unlimited). Forces QMux records to span
+    /// multiple TLS records for testing Wireshark desegmentation.
+    #[arg(long, default_value = "0")]
+    max_tls_write: usize,
+
+    /// Max QMux record size in bytes (0 = default 16382). Controls how much
+    /// frame data quiche packs into each QMux record.
+    #[arg(long, default_value = "0")]
+    max_record_size: u64,
 }
 
 #[tokio::main]
@@ -328,6 +338,12 @@ fn create_config(
     config.set_initial_max_streams_uni(args.max_streams_uni);
     config.set_max_idle_timeout(args.idle_timeout);
 
+    // Max QMux record size.
+    if args.max_record_size > 0 {
+        config.set_qmux_max_record_size(args.max_record_size);
+        log::info!("Max QMux record size: {} bytes", args.max_record_size);
+    }
+
     // Enable datagrams if echo mode is enabled.
     if args.dgram_echo {
         config.enable_dgram(true, 1000, 1000);
@@ -344,6 +360,9 @@ where
 {
     // Create QMux over TLS.
     let mut qmux = QmuxOverTls::new(tls_stream);
+    if args.max_tls_write > 0 {
+        qmux.set_max_tls_write(args.max_tls_write);
+    }
 
     // Create quiche config and connection.
     let mut config = create_config(args)?;
@@ -489,6 +508,9 @@ where
 {
     // Create QMux over TLS.
     let mut qmux = QmuxOverTls::new(tls_stream);
+    if args.max_tls_write > 0 {
+        qmux.set_max_tls_write(args.max_tls_write);
+    }
 
     // Create quiche config and connection.
     let mut config = create_config(args)?;
